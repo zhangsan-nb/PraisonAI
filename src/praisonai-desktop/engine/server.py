@@ -609,14 +609,22 @@ def _builtin_tools():
             url: An http(s) URL.
         """
         import re as _re
+        import urllib.error as _e
         import urllib.request as _r
 
         if not url.startswith(("http://", "https://")):
             return "Only http and https URLs are supported."
         if not _gate("fetch_url", {"url": url}):
             return "The user declined this tool call."
+
+        class _NoRedirect(_r.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                raise _e.HTTPError(req.full_url, code,
+                                   f"redirect to {newurl} was not approved",
+                                   headers, fp)
+
         try:
-            with _r.urlopen(url, timeout=20) as resp:
+            with _r.build_opener(_NoRedirect).open(url, timeout=20) as resp:
                 body = resp.read(400_000).decode("utf-8", "replace")
         except Exception as exc:  # noqa: BLE001
             return f"Fetch failed: {type(exc).__name__}: {exc}"
@@ -1598,8 +1606,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             _chat_path(self.path.rsplit("/", 1)[-1]).unlink(missing_ok=True)
-        except (OSError, ValueError):
-            pass
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
+            return
+        except OSError as exc:
+            # Reporting a delete that did not happen is how a conversation
+            # closed on screen and was back in the sidebar on reopen.
+            self._json({"ok": False, "error": str(exc)}, 500)
+            return
         self._json({"ok": True})
 
     def do_POST(self):
@@ -1685,11 +1699,16 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self.send_error(400)
                 return
-            saved = save_settings(patch)
             if "launch_at_login" in patch:
-                saved = dict(saved)
-                saved["launch_at_login_result"] = set_launch_at_login(
-                    bool(patch["launch_at_login"]))
+                # Persist what actually happened, not what was asked. Writing
+                # the request first made the toggle report a login item that
+                # was never registered -- and survive restarts saying so.
+                result = set_launch_at_login(bool(patch["launch_at_login"]))
+                patch = {**patch, "launch_at_login": bool(result.get("enabled"))}
+                saved = dict(save_settings(patch))
+                saved["launch_at_login_result"] = result
+            else:
+                saved = save_settings(patch)
             self._json(saved)
             return
 
