@@ -174,6 +174,8 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
         self._execution_count = 0
         self._success_count = 0
         self._failure_count = 0
+        self._undelivered_count = 0
+        self._delivered_count = 0
         self._start_time: Optional[datetime] = None
         
         # Sync lock for async primitives creation and bound loop tracking
@@ -397,6 +399,11 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
             "success_rate": (self._success_count / self._execution_count * 100) if self._execution_count > 0 else 0,
             "total_cost_usd": round(self._total_cost, 4),
             "remaining_budget": round(self.max_cost - self._total_cost, 4) if self.max_cost is not None else None,
+            # Explicit delivery-outcome counters (Issue #4454): never inferred
+            # from success minus undelivered, so NOT_CONFIGURED / SUPPRESSED
+            # runs never over-report a delivery.
+            "delivered_deliveries": getattr(self, "_delivered_count", 0),
+            "undelivered_deliveries": getattr(self, "_undelivered_count", 0),
         }
     
     async def _run_schedule(self, ticker: "ScheduleTicker", max_retries: int):
@@ -497,11 +504,27 @@ class AsyncAgentScheduler(_BaseAgentScheduler):
                 )
                 
                 # Deliver to the configured chat target (if any) off the event
-                # loop, since the shared delivery helper uses the sync bridge.
+                # loop, since the shared delivery helper uses the sync bridge,
+                # and fold the outcome into truthful accounting (Issue #4454):
+                # a run whose delivery fails is recorded ``undelivered`` and
+                # fires ``on_failure`` instead of a silent ``on_success``.
+                delivered_ok = True
                 if self.deliver:
-                    await asyncio.to_thread(self._deliver_result, result)
+                    delivered_ok = await asyncio.to_thread(
+                        self._finalize_delivery, result
+                    )
 
-                safe_call(self.on_success, result)
+                if delivered_ok:
+                    safe_call(self.on_success, result)
+                else:
+                    logger.error(
+                        "Scheduled run executed but its result could not be "
+                        "delivered to the configured target"
+                    )
+                    safe_call(
+                        self.on_failure,
+                        "scheduled result could not be delivered",
+                    )
                 await asyncio.to_thread(self._update_state_if_daemon)
                 return
                 

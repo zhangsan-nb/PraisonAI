@@ -12,6 +12,12 @@
       "require": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./mobile": {
+      "types": "./dist/mobile.d.ts",
+      "import": "./dist/esm/mobile.js",
+      "require": "./dist/mobile.js",
+      "default": "./dist/mobile.js"
+    },
     "./*": {
       "types": "./dist/*.d.ts",
       "import": "./dist/esm/*.js",
@@ -53,7 +59,8 @@
     "dev": "ts-node-dev --respawn src/main.ts",
     "example:arxiv": "ts-node examples/tools/arxiv-tools.ts",
     "clean": "rimraf dist",
-    "prebuild": "npm run clean"
+    "prebuild": "npm run clean",
+    "check:webview": "node scripts/webview-gate.mjs"
   },
   "keywords": [
     "ai",
@@ -102,7 +109,8 @@
     "@jest/types": "^29.6.3",
     "@jest/globals": "^29.7.0",
     "@ai-sdk/provider-utils": "^2.2.8",
-    "@opentelemetry/api": "^1.9.0"
+    "@opentelemetry/api": "^1.9.0",
+    "esbuild": "^0.25.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.1",

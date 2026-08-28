@@ -484,6 +484,14 @@ body.training #thread,body.training #f{display:none}
               <span class="hint">A Hugging Face id.</span>
             </div>
             <div class="tf">
+              <label for="tRunOn">Run on</label>
+              <select id="tRunOn" name="run_on">
+                <option value="local" selected>This computer</option>
+                <option value="remote">A remote server</option>
+              </select>
+              <span class="hint" id="tRunOnHint">Needs an NVIDIA GPU.</span>
+            </div>
+            <div class="tf">
               <label for="tMethod">Method</label>
               <select id="tMethod" name="method">
                 <option value="sft" selected>SFT — supervised fine-tuning</option>
@@ -496,6 +504,21 @@ body.training #thread,body.training #f{display:none}
                 <option value="cpo">CPO — contrastive preference</option>
               </select>
               <span class="hint" id="tMethodHint">Trains on completions.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemoteHost">SSH host</label>
+              <input id="tRemoteHost" name="remote_host" placeholder="gpubox"/>
+              <span class="hint">An alias from your ~/.ssh/config.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemotePython">Remote python</label>
+              <input id="tRemotePython" name="remote_python" value="python3"/>
+              <span class="hint">Interpreter on that machine.</span>
+            </div>
+            <div class="tf remote-only is-hidden">
+              <label for="tRemoteWorkdir">Remote directory</label>
+              <input id="tRemoteWorkdir" name="remote_workdir" value="~/.praisonai-train"/>
+              <span class="hint">Where the run works. Created if absent.</span>
             </div>
             <div class="tf">
               <label for="tDataset">Dataset</label>
@@ -775,7 +798,12 @@ const SETTINGS = [
 
   // ---- About --------------------------------------------------------------
   { key: "version", section: "about", label: "PraisonAI Desktop",
-    control: { kind: "readout", value: () => "0.1.0" } },
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_DESKTOP_VERSION__ || "unknown" } },
+
+  { key: "agents_version", section: "about", label: "PraisonAI Agents",
+    control: { kind: "readout", value: () =>
+      globalThis.__PRAISONAI_AGENTS_VERSION__ || "unknown" } },
 
   { key: "engine_status", section: "about", label: "Engine",
     description: "The Python process this window is talking to.",
@@ -827,7 +855,7 @@ window.__REGISTRY__ = { SECTIONS, SETTINGS, DEFAULTS, searchSettings };
 const { invoke } = window.__TAURI__.core;
 const turns=document.getElementById('turns'), thread=document.getElementById('thread');
 const status=document.getElementById('status'), box=document.getElementById('p'), send=document.getElementById('send');
-let PORT=null, atBottom=true, activeRun=null, activeReader=null;
+let PORT=null, engineBlocked=true, atBottom=true, activeRun=null, activeReader=null;
 /** Set by Regenerate for exactly one submit, then cleared. */
 let regenerateOf=null;
 // The renderer honours these directly -- everything in here was previously
@@ -1067,7 +1095,9 @@ const stick=()=>{ if(atBottom) thread.scrollTop=thread.scrollHeight; };
 // Compact markdown renderer. Deliberately small and dependency-free: a CDN is
 // unavailable to a packaged app, and the alternative -- shipping a full parser --
 // is a decision to make with measurements, not by default.
-const esc=t=>t.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+// Quotes included: without them a model-authored URL closes the href built in
+// inline() and injects attributes of its own -- id="f" clobbers getElementById('f').
+const esc=t=>t.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // Small tokeniser rather than a highlighter library: a CDN is unreachable from a
 // packaged app, and shipping a grammar engine is a decision to make with
 // measurements. Strings and comments match first, so a keyword inside one is
@@ -1350,7 +1380,10 @@ function gate(){
 }
 
 async function boot(){
+try{ globalThis.__PRAISONAI_DESKTOP_VERSION__=await window.__TAURI__.app.getVersion(); }catch{}
 const st=await invoke('engine_status');
+engineBlocked=st.state!=='ready';
+if(engineBlocked) showView('chat',{persist:false});
 if(st.state==='ready'){
   PORT=st.port; status.textContent=`engine :${PORT}`; status.className='s-ready';
   box.disabled=send.disabled=false; box.focus(); refreshChats(); refreshModelName();
@@ -1481,7 +1514,7 @@ function firstRun(st){
     }finally{ if(un) un(); }
   };
 }
-boot();
+const initialBoot=boot();
 
 document.getElementById('f').addEventListener('submit',async e=>{
   e.preventDefault();
@@ -1496,7 +1529,7 @@ document.getElementById('f').addEventListener('submit',async e=>{
   const out=turn('a','PraisonAI');
   out.innerHTML='<span class="caret"></span>';
 
-  let acc='', streamed=0, userIndex=null, versions=1, vactive=0;
+  let acc='', streamed=0, userIndex=null, versions=1, vactive=0, banner=false;
   const regen=regenerateOf; regenerateOf=null;   // consumed by this submit only
   const canPublish=gate();
   const host=out.parentElement;
@@ -1582,11 +1615,13 @@ document.getElementById('f').addEventListener('submit',async e=>{
           st.textContent=`${data.chars} chars · ${data.seconds}s`
             +(data.ttft!=null?` · ${data.ttft}s to first token`:'');
           host.appendChild(st); }
-        else if(ev==='error'){ out.innerHTML=md(acc);
+        else if(ev==='error'){ out.innerHTML=md(acc); banner=true;
           const titles={auth:'Authentication failed',rate_limit:'Rate limited',
-                        empty:'No output',internal:'The engine reported an error'};
+                        empty:'No output',
+                        no_answer:'The tools ran, but no answer came back',
+                        internal:'The engine reported an error'};
           fail(titles[data.kind]||titles.internal, data.message,'', text); }
-        else if(ev==='cancelled'){ paint();
+        else if(ev==='cancelled'){ paint(); banner=true;
           const c=document.createElement('div'); c.className='cancelled';
           c.textContent='Stopped'; out.parentElement.appendChild(c); }
         else if(ev==='end'){ paint(); userIndex=data?.user_index ?? null;
@@ -1594,7 +1629,13 @@ document.getElementById('f').addEventListener('submit',async e=>{
       }
     }
     paint();
-    if(!acc) fail('No output','The engine finished without producing any text.','',text);
+    // Only when nothing has already been said about it. The engine reports
+    // its own failures, and this line used to add a second banner underneath
+    // the first -- the screenshot of the bug shows both, which reads as two
+    // separate failures when it was one turn. It also fired after a deliberate
+    // Stop, calling the user's own cancellation an error.
+    if(!acc && !banner)
+      fail('No output','The engine finished without producing any text.','',text);
   }catch(err){ fail('Connection to the engine failed', String(err),'', text); }
   finally{
     clearInterval(thinkTimer); draft?.remove();
@@ -2035,6 +2076,10 @@ document.getElementById('settings').addEventListener('click',async()=>{
   try{
     cfg = await (await fetch('http://127.0.0.1:'+PORT+'/settings')).json();
   }catch(e){ engineDownPanel('Settings'); return; }
+  try{
+    const health=await (await fetch('http://127.0.0.1:'+PORT+'/health')).json();
+    globalThis.__PRAISONAI_AGENTS_VERSION__=health.agents_version||'unknown';
+  }catch(e){}
   settingsQuery=''; renderSettings(); overlay.classList.add('open');
   panel.querySelector('#setq').focus();
 });
@@ -2165,7 +2210,9 @@ const METHOD_HINTS={
 let trainStream=null, trainCursor=-1, trainRunId=null, lossSeries=[], logLines=[];
 const MAX_LOG_LINES=600;   // the pane is a tail, not an archive; the log file has it all
 
-function showView(name){
+function showView(name,{persist=true}={}){
+  const requested=name;
+  if(name==='train' && engineBlocked) name='chat';
   const training=name==='train';
   document.body.classList.toggle('training',training);
   trainView.classList.toggle('on',training);
@@ -2173,7 +2220,7 @@ function showView(name){
   viewChat.setAttribute('aria-selected',String(!training));
   viewTrain.classList.toggle('active',training);
   viewChat.classList.toggle('active',!training);
-  try{ localStorage.setItem('view',name); }catch(e){}
+  if(persist) try{ localStorage.setItem('view',requested); }catch(e){}
   if(training) refreshTraining();
 }
 viewChat.addEventListener('click',()=>showView('chat'));
@@ -2210,6 +2257,21 @@ function trainConfig(){
     train:true, ollama_save:false, huggingface_save:false};
   const steps=num('max_steps',0);
   if(steps>0) config.max_steps=steps;   // omitted, not zero: 0 means "no cap"
+
+  // Where it runs, expressed the same way the CLI and a hand-written YAML
+  // express it -- a `remote` block, or its absence. There is no separate mode
+  // flag to fall out of step with the block, and the engine passes the config
+  // through untouched, so `praisonai-train llm --config` does the routing.
+  if(get('run_on')==='remote'){
+    // get() already trims; the extra .trim() calls that were here implied
+    // otherwise.
+    const host=get('remote_host');
+    if(host){
+      config.remote={host,
+        python:get('remote_python')||'python3',
+        workdir:get('remote_workdir')||'~/.praisonai-train'};
+    }
+  }
   return config;
 }
 
@@ -2403,10 +2465,30 @@ document.getElementById('tMethod').addEventListener('change',e=>{
   document.getElementById('tMethodHint').textContent=METHOD_HINTS[e.target.value]||'';
 });
 
+document.getElementById('tRunOn').addEventListener('change',e=>{
+  const remote=e.target.value==='remote';
+  document.querySelectorAll('.remote-only').forEach(el=>{
+    el.classList.toggle('is-hidden',!remote); });
+  // Said plainly rather than discovered an hour in: fine-tuning needs CUDA,
+  // and a Mac does not have it, so "this computer" is not an option here on
+  // most of the machines this app runs on.
+  document.getElementById('tRunOnHint').textContent=remote
+    ? 'Runs over SSH. Uses your ssh agent — no password is stored.'
+    : 'Needs an NVIDIA GPU on this machine.';
+  document.getElementById('tRemoteHost').required=remote;
+});
+
 // Always go through showView, including for the default: it is what sets the
 // selected state on the nav, and skipping it for 'chat' left neither tab
 // looking selected on first launch.
 let startView='chat';
 try{ if(localStorage.getItem('view')==='train') startView='train'; }catch(e){}
-showView(startView);
+initialBoot.then(()=>{
+  let nextView=startView;
+  try{
+    const savedView=localStorage.getItem('view');
+    if(savedView==='chat'||savedView==='train') nextView=savedView;
+  }catch(e){}
+  showView(nextView);
+});
 </script></body></html>

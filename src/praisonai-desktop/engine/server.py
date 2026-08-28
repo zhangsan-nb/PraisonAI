@@ -30,8 +30,27 @@ from urllib.parse import urlparse
 # the one being edited -- the same source/installed-copy divergence that makes
 # a fix appear to have no effect. Explicit and visible here rather than via
 # PYTHONPATH, which would follow every child process invisibly.
-_SOURCE = pathlib.Path(__file__).resolve().parents[2] / "praisonai-agents"
-if (_SOURCE / "praisonaiagents" / "__init__.py").is_file():
+# Searched upward rather than counted: this file is copied into the bundle at
+# src-tauri/target/<profile>/engine/, where a fixed parents[2] resolves to
+# target/praisonai-agents -- which does not exist. So the branch quietly never
+# taken was the one whose whole purpose is to stop a fix having no effect.
+def _checkout_source():
+    """The praisonai-agents checkout above this file, if there is one."""
+    override = os.environ.get("PRAISONAI_AGENTS_SOURCE", "").strip()
+    if override:
+        candidate = pathlib.Path(override)
+        return candidate if (candidate / "praisonaiagents" / "__init__.py").is_file() else None
+    here = pathlib.Path(__file__).resolve()
+    for parent in here.parents:
+        for candidate in (parent / "praisonai-agents",
+                          parent / "src" / "praisonai-agents"):
+            if (candidate / "praisonaiagents" / "__init__.py").is_file():
+                return candidate
+    return None
+
+
+_SOURCE = _checkout_source()
+if _SOURCE is not None:
     sys.path.insert(0, str(_SOURCE))
 
 
@@ -290,7 +309,15 @@ def _chat_path(cid: str) -> pathlib.Path:
 
 def load_chat(cid: str) -> dict:
     try:
-        return json.loads(_chat_path(cid).read_text())
+        chat = json.loads(_chat_path(cid).read_text())
+        if not isinstance(chat, dict):
+            # Valid JSON, wrong shape -- the app's own export is a list. Every
+            # caller does chat.get(...), so a non-dict escapes as AttributeError
+            # and drops the connection. /projects and /search both call this on
+            # the same files list_chats() walks, so hardening only list_chats()
+            # left those two routes crashing on exactly the file this fixes.
+            raise ValueError("not a chat object")
+        return chat
     except (OSError, ValueError):
         # Absent and corrupt are answered the same way here on purpose: the
         # caller is opening a conversation, and either way there is nothing to
@@ -317,6 +344,9 @@ def list_chats() -> list:
     for f in CHATS_DIR.glob("*.json"):
         try:
             c = json.loads(f.read_text())
+            if not isinstance(c, dict):
+                # Valid JSON, wrong shape -- the app's own export is a list.
+                raise ValueError("not a chat object")
             out.append({
                 "id": c.get("id", f.stem),
                 "title": c.get("title") or "New chat",
@@ -688,10 +718,18 @@ class KeychainSecretStore:
                                check=True, capture_output=True, timeout=10,
                                **_quiet_subprocess_kwargs())
             else:
-                subprocess.run(["security", "delete-generic-password",
-                                "-s", KEYCHAIN_SERVICE, "-a", name],
-                               capture_output=True, timeout=10,
-                               **_quiet_subprocess_kwargs())
+                # The write path above checks its exit status; this one did
+                # not, and returned True regardless. A locked keychain leaves
+                # the item intact, so "your key was removed" was reported
+                # while the credential stayed live and came back on the next
+                # launch. 44 is "no such item", which is a delete that has
+                # already happened.
+                removed = subprocess.run(
+                    ["security", "delete-generic-password",
+                     "-s", KEYCHAIN_SERVICE, "-a", name],
+                    capture_output=True, timeout=10,
+                    **_quiet_subprocess_kwargs())
+                return removed.returncode in (0, 44)
             return True
         except Exception:  # noqa: BLE001 - a keychain failure must not lose the turn
             return False
@@ -721,9 +759,15 @@ class SecretToolSecretStore:
                                input=value.encode(), check=True,
                                capture_output=True, timeout=10)
             else:
-                subprocess.run(["secret-tool", "clear",
-                                "service", KEYCHAIN_SERVICE, "account", name],
-                               capture_output=True, timeout=10)
+                # As above: unchecked, so an unavailable D-Bus session (a
+                # headless or SSH login) reported a delete that never
+                # happened. `secret-tool clear` exits 0 when it matches
+                # nothing, so a non-zero status here is a real failure.
+                cleared = subprocess.run(
+                    ["secret-tool", "clear",
+                     "service", KEYCHAIN_SERVICE, "account", name],
+                    capture_output=True, timeout=10)
+                return cleared.returncode == 0
             return True
         except Exception:  # noqa: BLE001
             return False
@@ -1127,6 +1171,53 @@ def _get_agent(session_id: str = "default", tools: bool = True):
         return _agents[key]
 
 
+def _seed_history(agent, chat_id: str) -> int:
+    """Give the agent the conversation the user can already see.
+
+    The history existed in two places and only one of them was durable: the
+    transcript on disk, which the sidebar renders, and the agent's
+    chat_history, which is what the model is actually shown. Nothing ever
+    copied the first into the second.
+
+    The agent cache is a plain dict in this process (`_agents`), so it is empty
+    after any restart; `save_settings` clears it outright, because a model
+    change must not run on the previous agent; and the tools toggle keys a
+    *different* agent for the same session. After any of those, reopening a
+    chat showed the user their whole conversation while the model was handed a
+    blank slate -- and it said so: "I don't have access to your previous
+    questions. Each session is treated independently."
+
+    Only when the agent has nothing. An agent mid-session already holds the
+    turns, including tool messages this transcript never stored, and replaying
+    over the top would duplicate them.
+
+    Returns how many messages were replayed, for the log.
+    """
+    try:
+        if agent.chat_history:
+            return 0
+    except Exception:  # noqa: BLE001 - an agent without the attribute is not ours to seed
+        return 0
+    try:
+        stored = load_chat(chat_id).get("messages") or []
+    except Exception:  # noqa: BLE001 - a missing or broken transcript is not fatal
+        return 0
+
+    replayed = 0
+    for message in stored:
+        role, content = message.get("role"), message.get("content")
+        # Only the two roles a transcript holds, and never a blank turn: an
+        # empty assistant message is what a failed turn leaves behind, and
+        # feeding it back teaches the model that silence is an acceptable
+        # answer.
+        if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            agent._append_to_chat_history({"role": role, "content": content})
+            replayed += 1
+    if replayed:
+        log(f"replayed {replayed} messages into the agent for chat {chat_id}")
+    return replayed
+
+
 # --- stream protocol v2 -------------------------------------------------------
 # v1 carried only start/delta/end/error, which is enough to print text and
 # nothing else. Tool calls, reasoning and usage have to be first-class events or
@@ -1490,6 +1581,9 @@ class Handler(BaseHTTPRequestHandler):
         # rather than reproduce the default and hand the user a path the app
         # is not actually using.
         body = json.dumps({"ok": True, "version": PROTOCOL_VERSION,
+                           "shell_version": os.environ.get(
+                               "PRAISONAI_DESKTOP_VERSION", "unknown"),
+                           "agents_version": _installed_version(),
                            "data_dir": str(DATA_DIR)}).encode()
         self.send_response(200)
         self._cors()
@@ -1793,16 +1887,23 @@ class Handler(BaseHTTPRequestHandler):
             _tool_queue().clear()
             _apply_env(load_settings())
             agent = _get_agent(session, tools=tools_on)
+            # Before the turn, not at construction: the agent is cached per
+            # session and the transcript is per chat, and a settings change
+            # can drop the agent between one turn and the next.
+            _seed_history(agent, chat_id)
             emit("start", {"run_id": run_id})
             streamed = False
+            tools_shown = 0
             def _emit_drafting(name):
                 emit("tool_drafting", {"name": name})
 
             def _drain_tools():
                 """Emit any tool activity recorded since the last check."""
+                shown = 0
                 q = _tool_queue()
                 while q:
                     ev = q.pop(0)
+                    shown += 1
                     _emit_drafting(ev["name"])
                     emit("tool_call", {"call_id": ev["call_id"], "name": ev["name"],
                                        "args": ev["args"]})
@@ -1810,10 +1911,17 @@ class Handler(BaseHTTPRequestHandler):
                     emit("tool_result", {"call_id": ev["call_id"], "name": ev["name"],
                                          "ok": ev["ok"], "output": ev["output"],
                                          "seconds": ev["seconds"]})
+                return shown
 
             for chunk in agent.start(prompt, stream=True,
                                      **_llm_overrides(load_settings())):
-                _drain_tools()
+                # Counted here too. This call drains the queue, so discarding
+                # its result meant the tally further down always read zero
+                # unless the loop body never ran at all -- and the tests only
+                # covered that one case, so the count looked right while every
+                # stream that yielded anything before dying still reported
+                # "the engine produced no output" under its own tool cards.
+                tools_shown += _drain_tools()
                 if run_id and _is_cancelled(run_id):
                     # Verified by side effect: emission stops. The client is told
                     # explicitly rather than inferring it from a stream that ends.
@@ -1844,6 +1952,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     emit(event, frame)
             else:
+                # Tool activity belongs to the user even when the turn failed.
+                # Draining only on the success path meant a turn that ran tools
+                # and then died showed neither the answer nor the tools -- the
+                # work happened and left no trace.
+                tools_shown += _drain_tools()
                 if not streamed:
                     # A stream that yielded nothing is a failure, not an empty
                     # answer -- and the cause is usually in the logs, not here.
@@ -1856,11 +1969,19 @@ class Handler(BaseHTTPRequestHandler):
                     elif captured:
                         emit("error", {"kind": "internal",
                                        "message": captured[-1][:300]})
+                    elif tools_shown:
+                        # Not the same failure as "nothing happened". The tools
+                        # ran and their results are on screen; what is missing
+                        # is the model's answer about them. Saying "no output"
+                        # here described the turn to the user as a dead end
+                        # when most of it had in fact succeeded.
+                        emit("error", {"kind": "no_answer", "message":
+                             f"{tools_shown} tool call(s) ran, but the model "
+                             "sent no answer afterwards. Their results are above."})
                     else:
                         emit("error", {"message": "the engine produced no output",
                                        "kind": "empty"})
                 else:
-                    _drain_tools()
                     elapsed = time.perf_counter() - started
                     user_index = _persist(chat_id, prompt, reply, regenerate_of)
                     if cfg_now.get("show_stats", True):
@@ -1908,7 +2029,21 @@ def main():
     print(f"praisonai runtime listening on 127.0.0.1:{port}", flush=True)
     write_lock(port)
     atexit.register(clear_lock)
-    register_exit_signals(lambda *_: sys.exit(0))
+
+    def _stop_everything(*_):
+        # The trainer runs in its own session (start_new_session=True), so a
+        # signal aimed at the engine's process group never reaches it. If the
+        # engine simply exits, the fine-tune is reparented to init and keeps
+        # the GPU with nothing left that can find or stop it. Trainer.stop()
+        # terminates the trainer's own group first, so quit takes it down too.
+        if _TRAINER is not None:
+            try:
+                _TRAINER.stop()
+            except Exception:  # noqa: BLE001 - never block the quit
+                pass
+        sys.exit(0)
+
+    register_exit_signals(_stop_everything)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

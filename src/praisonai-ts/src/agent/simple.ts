@@ -6,6 +6,8 @@ import type { LLMProvider } from '../llm/providers/types';
 import type { BackendResolutionResult } from '../llm/backend-resolver';
 import { ApprovalManager, createCLIApprovalPrompt } from '../ai/tool-approval';
 import { getEnv } from '../llm/openaiClientOptions';
+import { randomUUID } from '../utils/uuid';
+import { parseModelString } from '../llm/backend-resolver';
 
 /**
  * The default token sink for `start()` when no `onToken` is supplied.
@@ -20,36 +22,6 @@ export function writeTokenToStdout(token: string): void {
   }
 }
 
-/**
- * Generate a RFC-4122 v4 UUID using WebCrypto.
- *
- * Uses `globalThis.crypto.randomUUID` (available in all supported webviews and
- * Node >= 19), falling back to a `getRandomValues`-based implementation so the
- * Agent import graph never pulls in the Node `crypto` builtin. This keeps the
- * module bundleable for browser/webview targets.
- */
-function randomUUID(): string {
-  const c = globalThis.crypto;
-  if (c?.randomUUID) {
-    return c.randomUUID();
-  }
-  const bytes = new Uint8Array(16);
-  if (c?.getRandomValues) {
-    c.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0'));
-  return (
-    hex[0] + hex[1] + hex[2] + hex[3] + '-' +
-    hex[4] + hex[5] + '-' +
-    hex[6] + hex[7] + '-' +
-    hex[8] + hex[9] + '-' +
-    hex[10] + hex[11] + hex[12] + hex[13] + hex[14] + hex[15]
-  );
-}
 
 /**
  * Agent Configuration
@@ -91,6 +63,38 @@ function randomUUID(): string {
  * truncated one instead of both looking identical.
  */
 export type StopReason = 'completed' | 'max_steps' | 'cancelled' | 'error';
+
+/**
+ * A single conversation message, as stored on the Agent.
+ *
+ * This is the shape returned by {@link Agent.getHistory} and accepted by
+ * {@link Agent.setHistory}. It carries the tool context (`tool_calls`,
+ * `tool_call_id`) so a saved conversation round-trips without silently
+ * dropping tool calls or their results — persisting `getHistory()` output is
+ * the intended way to save a chat for later restoration.
+ */
+export interface AgentMessage {
+  /** The provider role. A restored message with any other value is rejected. */
+  readonly role: 'system' | 'user' | 'assistant' | 'tool';
+  /** Text content. `null` on an assistant turn that only called tools. */
+  readonly content: string | null;
+  /** Present on an assistant turn that called tools. */
+  readonly tool_calls?: ReadonlyArray<{
+    id: string;
+    type: string;
+    function: { name: string; arguments: string };
+  }>;
+  /** Present on a tool turn; pairs it to the `tool_calls` entry above. */
+  readonly tool_call_id?: string;
+  /**
+   * The tool's name, present on a `tool` turn. Required so the AI SDK adapter
+   * (`toAISDKPrompt`) can set a non-empty `toolName` on the tool-result part —
+   * without it, a restored tool history sent to a non-OpenAI provider is
+   * rejected. The live tool loop already records this (`processToolCalls`); it
+   * must survive the getHistory/setHistory round-trip too.
+   */
+  readonly name?: string;
+}
 
 export interface SimpleAgentConfig {
   /** Agent instructions/system prompt (required) */
@@ -211,6 +215,19 @@ export interface SimpleAgentConfig {
  */
 export type AgentEvent =
   | { type: 'text'; delta: string }
+  /**
+   * A tool is about to run. `callId` is the provider's id for this invocation
+   * and is the ONLY key that may pair a result to its call -- matching by
+   * position holds only while exactly one call is ever in flight, and silently
+   * attributes the wrong output the moment that stops being true.
+   */
+  | { type: 'tool_call'; callId: string; name: string; args: Record<string, unknown> }
+  /**
+   * A tool finished. `ok` is the only signal of success: never infer it from a
+   * non-empty `output`, because a tool that failed with a message looks
+   * identical to one that succeeded with one.
+   */
+  | { type: 'tool_result'; callId: string; name: string; ok: boolean; output: string }
   | { type: 'finish'; text: string }
   | { type: 'error'; error: Error };
 
@@ -252,7 +269,7 @@ export class Agent {
   private dbAdapter?: DbAdapter;
   private sessionId: string;
   private runId: string;
-  private messages: Array<{ role: string; content: string | null; tool_calls?: any[]; tool_call_id?: string }> = [];
+  private messages: Array<{ role: string; content: string | null; tool_calls?: any[]; tool_call_id?: string; name?: string }> = [];
   private dbInitialized: boolean = false;
   private historyLimit: number;
   private autoRestore: boolean;
@@ -268,6 +285,12 @@ export class Agent {
   private _backendPromise: Promise<BackendResolutionResult> | null = null;
   private _backendSource: 'ai-sdk' | 'native' | 'custom' | 'legacy' = 'legacy';
   private _useAISDKBackend: boolean = false;
+  // Per-agent credentials. When a bare claude-*/gemini-* name routes to the
+  // AI-SDK backend, this key must reach resolveBackend() too -- otherwise the
+  // caller who passed apiKey (and no provider env var) authenticates on the
+  // OpenAI path but not on the one their model actually takes.
+  private _apiKey?: string;
+  private _baseURL?: string;
 
   constructor(config: SimpleAgentConfig) {
     // Build instructions from either simple or advanced mode
@@ -322,14 +345,33 @@ export class Agent {
     this.telemetryEnabled = config.telemetry ?? false;
     this.signal = config.signal;
     
-    // Parse model string to extract provider and model ID
-    // Format: "provider/model" or just "model"
-    const providerId = this.llm.includes('/') ? this.llm.split('/')[0] : 'openai';
-    const modelId = this.llm.includes('/') ? this.llm.split('/').slice(1).join('/') : this.llm;
+    // Parse model string to extract provider and model ID.
+    //
+    // This was a private copy of the parsing rule that defaulted EVERY
+    // slash-less name to OpenAI -- so `new Agent({ llm:
+    // 'claude-3-5-sonnet-latest' })` sent an OpenAI-format request, with
+    // OpenAI-format tools, to the OpenAI endpoint. Not a dropped tool: the
+    // whole call went to the wrong vendor, surfacing as model-not-found or
+    // as a confusing bill. parseModelString already infers anthropic from a
+    // `claude-` prefix and google from `gemini-`, so there is one rule now
+    // rather than two that disagree.
+    //
+    // A custom baseURL is the exception, deliberately: pointing at an
+    // OpenAI-compatible proxy that serves `claude-*` is a real deployment,
+    // and prefix inference would route it away from the endpoint the caller
+    // explicitly asked for.
+    const hasCustomEndpoint = config.baseURL !== undefined && config.baseURL !== '';
+    const parsed = hasCustomEndpoint && !this.llm.includes('/')
+      ? { providerId: 'openai', modelId: this.llm }
+      : parseModelString(this.llm);
+    const providerId = parsed.providerId;
+    const modelId = parsed.modelId;
     
     // For OpenAI, use OpenAIService directly for backward compatibility
     // For other providers, we'll use the AI SDK backend via getBackend()
     this._useAISDKBackend = providerId !== 'openai';
+    this._apiKey = config.apiKey;
+    this._baseURL = config.baseURL;
     this.llmService = new OpenAIService(modelId, {
       apiKey: config.apiKey,
       baseURL: config.baseURL,
@@ -651,13 +693,19 @@ export class Agent {
    * @param signal Optional AbortSignal; if already aborted, no tool is invoked
    * @returns Array of tool results
    */
-  private async processToolCalls(toolCalls: Array<any>, signal?: AbortSignal): Promise<Array<{role: string, tool_call_id: string, name: string, content: string}>> {
+  private async processToolCalls(toolCalls: Array<any>, signal?: AbortSignal, onEvent?: (event: AgentEvent) => void): Promise<Array<{role: string, tool_call_id: string, name: string, content: string}>> {
     const results = [];
     
     for (const toolCall of toolCalls) {
       const { id, function: { name, arguments: argsString } } = toolCall;
       await Logger.debug(`Processing tool call: ${name}`, { arguments: argsString });
-      
+
+      // Track whether tool_call was already announced so the catch below can
+      // announce it if a parse/validation failure rejected the call before the
+      // normal emission point -- otherwise that path emits an orphan
+      // tool_result with no matching tool_call to pair by callId.
+      let toolCallEmitted = false;
+
       try {
         // Cancellation reaches the side-effecting boundary: if the caller
         // aborts after the model returned tool calls, stop before invoking the
@@ -668,9 +716,23 @@ export class Agent {
           throw (signal as any).reason ?? new Error('The operation was aborted');
         }
 
-        // Parse arguments
-        const args = JSON.parse(argsString);
-        
+        // Parse arguments. JSON.parse can yield null, an array or a scalar;
+        // AgentEvent.args declares Record<string, unknown>, and a tool wrapper
+        // expecting named arguments cannot use any of those. Reject them here
+        // so the contract holds for both the event and the invocation.
+        const parsedArgs: unknown = JSON.parse(argsString);
+        if (parsedArgs === null || typeof parsedArgs !== 'object' || Array.isArray(parsedArgs)) {
+          throw new Error(`Invalid arguments for tool ${name}: expected a JSON object`);
+        }
+        const args = parsedArgs as Record<string, unknown>;
+
+        // Announced BEFORE anything can reject it, so every tool_result -- a
+        // denial, a missing function, a thrown error -- has a matching
+        // tool_call to pair with by callId. Emitting it only past the gates
+        // left a denied or unregistered call producing an orphan result.
+        onEvent?.({ type: 'tool_call', callId: id, name, args });
+        toolCallEmitted = true;
+
         // Check if function exists
         if (!this.toolFunctions[name]) {
           throw new Error(`Function ${name} not registered`);
@@ -687,12 +749,11 @@ export class Agent {
           });
           if (!approved) {
             await Logger.debug(`Tool call denied by approval gate: ${name}`);
-            results.push({
-              role: 'tool',
-              tool_call_id: id,
-              name,
-              content: `Error: Tool call "${name}" was denied by the approval gate.`
-            });
+            const denial = `Error: Tool call "${name}" was denied by the approval gate.`;
+            results.push({ role: 'tool', tool_call_id: id, name, content: denial });
+            // ok:false -- a denied tool did not run, and rendering it as a
+            // success tells the user something happened that did not.
+            onEvent?.({ type: 'tool_result', callId: id, name, ok: false, output: denial });
             continue;
           }
         }
@@ -719,7 +780,8 @@ export class Agent {
           name,
           content
         });
-        
+        onEvent?.({ type: 'tool_result', callId: id, name, ok: true, output: content });
+
         await Logger.debug(`Tool call result for ${name}:`, { result });
       } catch (error: any) {
         // Cancellation is terminal: surface it to the caller instead of
@@ -728,19 +790,37 @@ export class Agent {
           throw (signal as any).reason ?? error;
         }
         await Logger.error(`Error executing tool ${name}:`, error);
-        results.push({
-          role: 'tool',
-          tool_call_id: id,
-          name,
-          content: `Error: ${error.message || 'Unknown error'}`
-        });
+        const failure = `Error: ${error.message || 'Unknown error'}`;
+        results.push({ role: 'tool', tool_call_id: id, name, content: failure });
+        // Malformed JSON or a non-object args value throws before the normal
+        // tool_call emission. Announce it here (with empty args, since none
+        // could be parsed) so this failure result still has a matching
+        // tool_call by callId rather than orphaning it.
+        if (!toolCallEmitted) {
+          onEvent?.({ type: 'tool_call', callId: id, name, args: {} });
+        }
+        // The case the whole `ok` field exists for: a tool that failed WITH a
+        // message is byte-identical to one that succeeded with a message, so
+        // success can never be inferred from a non-empty output.
+        onEvent?.({ type: 'tool_result', callId: id, name, ok: false, output: failure });
       }
     }
     
     return results;
   }
 
-  async start(prompt: string, previousResult?: string, onToken?: (token: string) => void, signal?: AbortSignal): Promise<string> {
+  async start(
+    prompt: string,
+    previousResult?: string,
+    onToken?: (token: string) => void,
+    signal?: AbortSignal,
+    /**
+     * Structured events, for callers that need to SEE tool activity rather
+     * than infer it from prose. Optional and additive: every existing caller
+     * passes four arguments and gets exactly the behaviour it had before.
+     */
+    onEvent?: (event: AgentEvent) => void,
+  ): Promise<string> {
     await Logger.debug(`Agent ${this.name} starting with prompt: ${prompt}`);
 
     // Token sink: when a caller (e.g. stream()) supplies onToken, tokens go
@@ -763,11 +843,20 @@ export class Agent {
         { role: 'system', content: this.createSystemPrompt() }
       ];
       
-      // Add conversation history (excluding the current prompt which will be added below)
+      // Add conversation history (excluding the current prompt which will be added below).
+      // Preserve tool context so a restored tool-calling conversation replays
+      // intact: an assistant turn that only called tools has null content but
+      // still carries tool_calls, and its paired tool result carries tool_call_id.
       for (const msg of this.messages) {
-        if (msg.role && msg.content) {
-          messages.push({ role: msg.role, content: msg.content });
-        }
+        if (!msg.role) continue;
+        if (msg.content == null && !msg.tool_calls) continue;
+        const replay: any = { role: msg.role, content: msg.content };
+        if (msg.tool_calls) replay.tool_calls = msg.tool_calls;
+        if (msg.tool_call_id) replay.tool_call_id = msg.tool_call_id;
+        // Carry the tool name so a restored tool result keeps a non-empty
+        // toolName on the AI SDK path (toAISDKPrompt reads msg.name).
+        if (msg.name) replay.name = msg.name;
+        messages.push(replay);
       }
       
       // Add current user prompt
@@ -800,13 +889,47 @@ export class Agent {
               throw (abortSignal as any).reason ?? new Error('The operation was aborted');
             }
 
-            const result = await backend.generateText({
-              messages,
-              temperature: 0.7,
-              tools: toolDefinitions,
-              toolChoice: 'auto',
-              signal: abortSignal,
-            });
+            // Stream the round when streaming is on, instead of always calling
+            // generateText. Two things were wrong with doing it unconditionally:
+            // `stream: true` silently had no effect once tools were configured on
+            // any non-OpenAI provider, and -- worse -- the round's assistant text
+            // was DROPPED. A model that says "Let me check." before calling a
+            // tool had that sentence recorded into `messages` for its own context
+            // and never delivered to the caller, so a user saw a tool run with no
+            // explanation of why.
+            //
+            // StreamChunk carries text AND toolCalls, and StreamTextOptions
+            // extends GenerateTextOptions, so one shape covers both.
+            let result: { text: string; toolCalls?: any[] };
+            if (this.streamEnabled) {
+              const stream = await backend.streamText({
+                messages,
+                temperature: 0.7,
+                tools: toolDefinitions,
+                toolChoice: 'auto',
+                signal: abortSignal,
+              });
+              let streamedText = '';
+              const streamedCalls: any[] = [];
+              for await (const chunk of stream) {
+                if (chunk.text) {
+                  emitToken(chunk.text);
+                  streamedText += chunk.text;
+                }
+                if (chunk.toolCalls && chunk.toolCalls.length > 0) {
+                  streamedCalls.push(...chunk.toolCalls);
+                }
+              }
+              result = { text: streamedText, toolCalls: streamedCalls.length > 0 ? streamedCalls : undefined };
+            } else {
+              result = await backend.generateText({
+                messages,
+                temperature: 0.7,
+                tools: toolDefinitions,
+                toolChoice: 'auto',
+                signal: abortSignal,
+              });
+            }
 
             messages.push({
               role: 'assistant',
@@ -815,7 +938,7 @@ export class Agent {
             });
 
             if (result.toolCalls && result.toolCalls.length > 0) {
-              const toolResults = await this.processToolCalls(result.toolCalls, abortSignal);
+              const toolResults = await this.processToolCalls(result.toolCalls, abortSignal, onEvent);
               messages.push(...toolResults);
               continueConversation = true;
             } else {
@@ -948,7 +1071,7 @@ export class Agent {
             }
 
             // Process tool calls and add results to messages
-            const toolResults = await this.processToolCalls(perTurn, abortSignal);
+            const toolResults = await this.processToolCalls(perTurn, abortSignal, onEvent);
             messages.push(...toolResults);
 
             // Continue conversation to get final response
@@ -997,6 +1120,20 @@ export class Agent {
         // generateText only takes a single prompt + system prompt, so on a
         // follow-up it dropped every earlier turn and produced contextually
         // wrong structured responses.
+        const response = await this.llmService.generateChat(
+          messages,
+          0.7,
+          undefined,
+          undefined,
+          this.getResponseFormat(),
+          abortSignal
+        );
+        finalResponse = response.content || '';
+      } else if (this.messages.length > 0) {
+        // Prior conversation history exists (e.g. restored via setHistory).
+        // generateText only takes a single prompt + system prompt and drops
+        // every earlier turn, so a restored chat would be invisible to the
+        // model. generateChat sends the full `messages` history built above.
         const response = await this.llmService.generateChat(
           messages,
           0.7,
@@ -1098,7 +1235,7 @@ export class Agent {
    * ```
    */
   async *streamEvents(prompt: string, opts?: AgentStreamOptions): AsyncIterable<AgentEvent> {
-    const queue: string[] = [];
+    const queue: AgentEvent[] = [];
     let notify: (() => void) | null = null;
     let done = false;
     let cancelled = false;
@@ -1125,11 +1262,21 @@ export class Agent {
     const wake = () => { const n = notify; notify = null; n?.(); };
     const onToken = (token: string) => {
       if (cancelled) return;
-      queue.push(token);
+      queue.push({ type: 'text', delta: token });
+      wake();
+    };
+    // Structured events share the SAME queue as the text, which is what keeps
+    // a tool call in its true position. A separate channel would let it arrive
+    // before the sentence that introduced it, or after the one reporting its
+    // result -- and a reader cannot tell a reordered transcript from a model
+    // that genuinely said things in that order.
+    const onEvent = (event: AgentEvent) => {
+      if (cancelled) return;
+      queue.push(event);
       wake();
     };
 
-    const run = this.start(prompt, opts?.previousResult, onToken, controller.signal)
+    const run = this.start(prompt, opts?.previousResult, onToken, controller.signal, onEvent)
       .then((text) => ({ text } as { text: string }))
       .catch((error) => ({
         error: error instanceof Error ? error : new Error(String(error)),
@@ -1142,7 +1289,7 @@ export class Agent {
           await new Promise<void>((resolve) => { notify = resolve; });
           continue;
         }
-        yield { type: 'text', delta: queue.shift()! };
+        yield queue.shift()!;
       }
 
       const result = await run;
@@ -1244,10 +1391,113 @@ export class Agent {
   }
 
   /**
-   * Get conversation history
+   * Get the full conversation history, including tool context.
+   *
+   * The returned messages carry `tool_calls` and `tool_call_id`, so persisting
+   * this output is a lossless way to save a chat — a tool-calling conversation
+   * survives the round-trip through {@link Agent.setHistory}. The array and its
+   * messages are copied on read: mutating the result does not change the
+   * agent's state.
+   *
+   * @returns A copy of the conversation history.
    */
-  getHistory(): Array<{ role: string; content: string | null }> {
-    return [...this.messages];
+  getHistory(): AgentMessage[] {
+    return this.messages.map(m => this.copyMessage(m));
+  }
+
+  /**
+   * Restore a previously saved conversation so the model regains its memory of
+   * it. Without this, reopening a saved chat renders the transcript on screen
+   * while the model behaves as though the conversation never happened.
+   *
+   * Input is validated because it comes from disk, and disk contents outlive
+   * the code that wrote them. A malformed history accepted here would fail on
+   * the *next* model call, far from the code that loaded it, so it is refused
+   * loudly and immediately:
+   *
+   * - a non-array input, or a message that is not an object, is rejected
+   * - an unknown `role` is rejected
+   * - a `tool` message whose `tool_call_id` matches no preceding `tool_calls`
+   *   entry is rejected (an orphaned tool result is a 400 from every provider)
+   *
+   * `system` messages: a leading `system` message is accepted and stripped.
+   * `start()` prepends the agent's own instructions as the system prompt on
+   * every run, so keeping a restored one would double it. Any non-leading
+   * `system` message is rejected as malformed.
+   *
+   * The input is copied on write, mirroring {@link Agent.getHistory}'s copy on
+   * read: mutating the array you pass in does not change the agent's state.
+   *
+   * @param messages The conversation to restore, e.g. from `getHistory()`.
+   * @throws {Error} If the history is malformed (see rules above).
+   */
+  setHistory(messages: readonly AgentMessage[]): void {
+    if (!Array.isArray(messages)) {
+      throw new Error('setHistory: expected an array of messages');
+    }
+
+    const validRoles = new Set(['system', 'user', 'assistant', 'tool']);
+    const knownToolCallIds = new Set<string>();
+    const restored: Array<{ role: string; content: string | null; tool_calls?: any[]; tool_call_id?: string; name?: string }> = [];
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) {
+        throw new Error(`setHistory: message at index ${i} is not an object`);
+      }
+      if (!validRoles.has(msg.role)) {
+        throw new Error(`setHistory: message at index ${i} has unknown role "${msg.role}"`);
+      }
+      if (msg.role === 'system') {
+        // A leading system message is redundant with the instructions start()
+        // prepends, so strip it. Anywhere else it is malformed.
+        if (i === 0) continue;
+        throw new Error(`setHistory: unexpected system message at index ${i} (only a leading system message is allowed)`);
+      }
+      if (msg.role === 'tool') {
+        if (!msg.tool_call_id || !knownToolCallIds.has(msg.tool_call_id)) {
+          throw new Error(`setHistory: tool message at index ${i} has orphaned tool_call_id "${msg.tool_call_id}" (no preceding assistant tool call matches it)`);
+        }
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        for (const call of msg.tool_calls) {
+          if (call && typeof call.id === 'string') {
+            knownToolCallIds.add(call.id);
+          }
+        }
+      }
+      restored.push(this.copyMessage(msg));
+    }
+
+    this.messages = restored;
+    // Replacing the conversation invalidates any cached answers keyed by prompt
+    // alone: a repeat prompt must be re-evaluated against the restored history,
+    // not served the previous conversation's response.
+    this.responseCache.clear();
+  }
+
+  /**
+   * Deep-copy a single message so neither getHistory() nor setHistory() shares
+   * the caller's mutable references (tool_calls is an array of objects).
+   */
+  private copyMessage(m: AgentMessage | { role: string; content: string | null; tool_calls?: any[]; tool_call_id?: string; name?: string }): any {
+    const copy: any = { role: m.role, content: m.content };
+    if (m.tool_calls) {
+      copy.tool_calls = m.tool_calls.map((c: any) => ({
+        id: c.id,
+        type: c.type,
+        function: c.function ? { name: c.function.name, arguments: c.function.arguments } : c.function
+      }));
+    }
+    if (m.tool_call_id) {
+      copy.tool_call_id = m.tool_call_id;
+    }
+    // Preserve the tool name so a restored tool result keeps a non-empty
+    // toolName when converted for the AI SDK backend (adapter.ts toAISDKPrompt).
+    if (m.name) {
+      copy.name = m.name;
+    }
+    return copy;
   }
 
   /**
@@ -1284,7 +1534,17 @@ export class Agent {
     if (!this._backendPromise) {
       this._backendPromise = (async () => {
         const { resolveBackend } = await import('../llm/backend-resolver');
+        // Forward the per-agent apiKey/baseURL so a bare claude-*/gemini-*
+        // that now routes here can authenticate on the same key the caller
+        // gave the constructor -- not only via a provider env var.
+        const config = (this._apiKey || this._baseURL)
+          ? {
+              ...(this._apiKey ? { apiKey: this._apiKey } : {}),
+              ...(this._baseURL ? { baseUrl: this._baseURL } : {}),
+            }
+          : undefined;
         const result = await resolveBackend(this.llm, {
+          config,
           attribution: {
             agentId: this.name,
             runId: this.runId,
