@@ -23,7 +23,8 @@
  * passes on an empty result forever.
  */
 import * as esbuild from "esbuild";
-import { relative, resolve, dirname, sep } from "node:path";
+import { relative, resolve, dirname, join, sep } from "node:path";
+import { readdirSync, statSync } from "node:fs";
 
 /** Node builtins are always allowed; the bundler aliases or excludes them. */
 const isBuiltin = (specifier) =>
@@ -222,4 +223,88 @@ export function violations(importMap, config) {
     }
   }
   return found;
+}
+
+/**
+ * Top-level directories under `root` holding TS/MJS that neither
+ * `config.governedRoots` nor `config.ungovernedRoots` accounts for.
+ *
+ * Without this, governedRoots is only a list of what to WALK: a new top-level
+ * directory is never visited, so it may import across every seam and the
+ * checker still prints "no violations". boundaries.json has claimed this was
+ * enforced since it was written; it was not. A rule that quietly stops
+ * covering new code while reporting a clean pass is worse than no rule.
+ *
+ * Takes `root` as an argument rather than deriving it, so a test can point it
+ * at a fixture tree instead of mutating the real one.
+ */
+export function ungovernedRootsIn(root, config) {
+  const known = new Set([...(config.governedRoots ?? []), ...(config.ungovernedRoots ?? [])]);
+  const out = [];
+  let entries;
+  try {
+    entries = readdirSync(root);
+  } catch {
+    return out;
+  }
+  for (const entry of entries.slice().sort()) {
+    if (known.has(entry) || entry === "node_modules" || entry === "dist") continue;
+    if (entry.startsWith(".")) continue;
+    let isDir = false;
+    try {
+      isDir = statSync(join(root, entry)).isDirectory();
+    } catch {
+      continue;
+    }
+    if (!isDir) continue;
+    let count = 0;
+    const walk = (dir) => {
+      for (const e of readdirSync(dir)) {
+        if (e === "node_modules" || e === "dist" || e.startsWith(".")) continue;
+        const full = join(dir, e);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (e.endsWith(".ts") || e.endsWith(".mjs")) count++;
+      }
+    };
+    try {
+      walk(join(root, entry));
+    } catch {
+      continue;
+    }
+    if (count > 0) out.push({ name: entry, count });
+  }
+  return out;
+}
+
+/**
+ * Every source file under `roots`, relative to `base`.
+ *
+ * Extracted from check-boundaries.mjs so a test can call it. Dropping the
+ * `.mjs` half of the extension test survived the whole suite: the checker
+ * silently stops walking every .mjs in the package and still prints "no
+ * violations". That is verbatim what boundaries.json's own comment warns
+ * about -- "a rule that stops covering new code while still reporting a clean
+ * pass is worse than no rule" -- and tools/ is entirely .mjs.
+ *
+ * `.ts` AND `.mjs`, and nothing else: a .md or a .json under a governed root
+ * is not code and must not be parsed as any.
+ */
+export function sourceFilesUnder(base, roots) {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return; // a governed root that does not exist yet is not an error
+    }
+    for (const entry of entries) {
+      if (entry === "node_modules" || entry === "dist" || entry.startsWith(".")) continue;
+      const full = join(dir, entry);
+      if (statSync(full).isDirectory()) walk(full);
+      else if (entry.endsWith(".ts") || entry.endsWith(".mjs")) out.push(full);
+    }
+  };
+  for (const rootName of roots) walk(join(base, rootName));
+  return out;
 }

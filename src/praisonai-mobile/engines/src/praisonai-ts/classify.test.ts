@@ -56,3 +56,31 @@ test("statusOf reads the shapes providers actually throw", () => {
   assert.equal(statusOf(null), null);
   assert.equal(statusOf({ status: "429" }), null, "a string status is not a status");
 });
+
+test("an HTTP 500 is transport, so the UI still offers Retry", () => {
+  // `status >= 500` -> `> 500` survived. A plain 500 -- the single most common
+  // provider failure -- would classify as `internal`, whose recovery is
+  // `none`: the user is told something went wrong and offered no way to try
+  // again. 502 and 503 are unaffected, so the boundary is exactly the case
+  // that matters most.
+  for (const status of [500, 501, 502, 503, 504]) {
+    assert.equal(classifyError({ status } as never), "transport", `HTTP ${status}`);
+  }
+});
+
+test("a 4xx is not transport, so Retry is not offered where it cannot help", () => {
+  // The pair. Classifying everything as transport offers Retry for a bad
+  // request or a revoked key, which can never succeed.
+  assert.notEqual(classifyError({ status: 400 } as never), "transport");
+  assert.notEqual(classifyError({ status: 422 } as never), "transport");
+});
+
+test("a 403 is an auth failure even when its message says nothing useful", () => {
+  // Dropping `status === 403` survived because the message-matching branch
+  // catches anything that literally contains "403" or "forbidden". A provider
+  // returning `{status: 403, message: "nope"}` then classifies as `internal`,
+  // and the user gets no route to their credentials -- which is the whole
+  // reason ErrorKind separates auth from everything else.
+  assert.equal(classifyError({ status: 403, message: "nope" } as never), "auth");
+  assert.equal(classifyError({ status: 401, message: "nope" } as never), "auth");
+});

@@ -29,6 +29,19 @@ export interface PendingApproval {
   readonly callId: string;
   readonly name: string;
   readonly args: Readonly<Record<string, unknown>>;
+  /**
+   * True once the turn ended without this approval being answered.
+   *
+   * Resolved means not actionable -- the view renders it as history rather
+   * than as a live prompt -- but the row is KEPT, so an ended turn can still
+   * say what it asked for.
+   *
+   * Optional because absent IS the answer for every approval that has not been
+   * settled, which is all of them until a turn ends. Requiring `resolved:
+   * false` at each of the dozen construction sites would be noise carrying no
+   * information, and noise is where a real value gets mistyped unnoticed.
+   */
+  readonly resolved?: boolean;
 }
 
 export type Outcome =
@@ -83,6 +96,16 @@ export interface TurnState {
    * quiet success, which is the failure this whole package is built against.
    */
   readonly dropped: readonly Dropped[];
+  /**
+   * Drops recorded while NO turn was streaming, waiting for the next `start`.
+   *
+   * `start` used to carry `state.dropped` wholesale, which is the previous
+   * turn's ENTIRE list -- so one refusal on turn 1 made every later turn
+   * report itself damaged, for the lifetime of the app, and the count could
+   * never be used for "this stream is 40% unparseable". Only what arrived
+   * between the turns belongs to the next one.
+   */
+  readonly carry: readonly Dropped[];
 }
 
 export const initialTurn: TurnState = {
@@ -98,12 +121,45 @@ export const initialTurn: TurnState = {
   usage: null,
   outcome: null,
   dropped: [],
+  carry: [],
 };
 
-const drop = (state: TurnState, reason: Dropped["reason"], detail: string): TurnState => ({
-  ...state,
-  dropped: [...state.dropped, { reason, detail }],
-});
+const drop = (state: TurnState, reason: Dropped["reason"], detail: string): TurnState => {
+  const d: Dropped = { reason, detail };
+  return {
+    ...state,
+    dropped: [...state.dropped, d],
+    // A drop that arrives while nothing is streaming belongs to the turn that
+    // has not started yet, so `start` can carry exactly those and nothing else.
+    //
+    // Except `after_terminal`, which is the one out-of-band drop that IS about
+    // the turn just finished: a frame from the old run arriving late is
+    // evidence against the old run, and moving it forward would blame the next
+    // answer for its predecessor's mess. A decoder refusal between turns is
+    // different -- it has no msgId at all, so it cannot be attributed
+    // backwards and belongs to the turn about to open.
+    carry:
+      state.phase === "streaming" || reason === "after_terminal"
+        ? state.carry
+        : [...state.carry, d],
+  };
+};
+
+/**
+ * Record a frame the DECODER refused, before it could ever become an event.
+ *
+ * `apply` can only record events it was given, so a frame that failed to decode
+ * had no way in -- which is why `Dropped.reason` admitted every IgnoredReason
+ * while no IgnoredReason could reach a transcript. A malformed `tool_result`
+ * made its tool vanish and the turn rendered as a clean answer.
+ */
+export function noteDropped(
+  state: TurnState,
+  reason: Dropped["reason"],
+  detail: string,
+): TurnState {
+  return drop(state, reason, detail);
+}
 
 /**
  * Apply one event.
@@ -124,12 +180,45 @@ export function apply(state: TurnState, event: RunEvent): TurnState {
       runId: event.runId,
       // Carried across deliberately: a turn that dropped events before it
       // started still dropped them, and hiding that would lose the evidence.
-      dropped: state.dropped,
+      // ONLY those, though: carrying `state.dropped` meant inheriting the
+      // whole previous turn and reporting every later turn as damaged.
+      //
+      // `state.carry` rather than `state.phase === "ended" ? [] : state.dropped`
+      // -- the two fixes for this landed independently and both stop the leak,
+      // but the phase test loses a frame refused BETWEEN turns: the previous
+      // turn has ENDED, so its list is discarded wholesale and the refusal that
+      // arrived after it goes with it. Measured on both: the clean-turn case
+      // passes either way; the between-turns case is 1 with `carry` and 0
+      // without. Losing evidence quietly is the failure this whole channel
+      // exists to undo.
+      dropped: state.carry,
+      carry: [],
     };
   }
 
   if (state.phase === "idle") {
-    // engine/server.py emits `start` first, always. Anything before it is
+    // An `error` is the exception, and it is the common case on a phone.
+    //
+    // A failure before the first token -- 401, 403, 500, a refused connection,
+    // no network, a wrong baseUrl -- is still THIS turn's outcome, not a stray
+    // frame from a previous run. Dropping it threw the real reason away and
+    // `finish()` then substituted `kind: "empty"`, so every one of those
+    // rendered identically as "the engine produced no output" plus a dropped
+    // row accusing the engine of sending an event before the turn began.
+    //
+    // The default baseUrl is 127.0.0.1:8765, which on a phone is the phone
+    // itself, so that was the FIRST thing every new user saw. It also made the
+    // `kind: "auth"` -> `recovery: "settings"` branch unreachable: the one
+    // distinction between "retry this" and "go fix your credentials" never
+    // survived to the view model.
+    if (event.type === "error") {
+      return apply(
+        { ...state, phase: "streaming", msgId: event.msgId, dropped: state.carry, carry: [] },
+        event,
+      );
+    }
+
+    // engine/server.py emits `start` first, always. Anything else before it is
     // either a bug or a frame from a previous run arriving late.
     return drop(state, "before_start", event.type);
   }
@@ -265,8 +354,12 @@ function settle(state: TurnState, outcome: Outcome): TurnState {
     drafting: null,
     // A call with no result is `unresolved`, never `ok`. Silence is not success.
     tools: state.tools.map((t) => (t.status === "running" ? { ...t, status: "unresolved" } : t)),
-    // An approval nobody answered is no longer actionable once the turn is over.
-    approvals: [],
+    // KEPT, not emptied. An approval nobody answered stops being ACTIONABLE
+    // when the turn ends -- but it is still what the run asked for, and an
+    // ended turn that cannot say so has lost the most important thing on it:
+    // a transcript could never afterwards show "you were asked to allow
+    // `rm -rf /` and the turn ended first".
+    approvals: state.approvals.map((a) => (a.resolved ? a : { ...a, resolved: true })),
   };
 }
 

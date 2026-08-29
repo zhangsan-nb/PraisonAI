@@ -12,18 +12,25 @@
  * 8 of 16 mutations survived a 408-test suite.
  */
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
 import { describeStorageContract } from "./storage-contract.ts";
+import { describeSecretsContract } from "./secrets-contract.ts";
+import { describeTimeContract } from "./time-contract.ts";
 import { describeShellContract, type ShellHarness } from "./shell-contract.ts";
 import { createFakeStorage } from "../../../testing/src/fake-storage.ts";
 import { createFakeShell, PHONE_INSETS } from "../../../testing/src/fake-shell.ts";
 import { createWebStorage } from "../web/storage.ts";
 import { createWebSecrets } from "../web/secrets.ts";
+import { createWebTime } from "../web/time.ts";
+import { createFakeSecrets } from "../../../testing/src/fake-secrets.ts";
+import { createFakeTime } from "../../../testing/src/fake-time.ts";
 import { createWebShell } from "../web/shell.ts";
 import { INSET_VARIABLES } from "../../../core/src/ports/shell.ts";
 import { createFakeWindow } from "../web/fake-window.ts";
-import { createWebTime } from "../web/time.ts";
 import { createTauriBridge, type TauriBridge } from "../tauri/bridge.ts";
 import {
   createTauriShell,
@@ -54,6 +61,42 @@ function memoryStorage(): Storage {
 
 describeStorageContract("fake storage", () => createFakeStorage());
 describeStorageContract("web storage", () => createWebStorage(memoryStorage()));
+
+// The SecretsPort had no contract and no test of any kind. Collapsing the web
+// adapter's key from `${slot}:${account}` to `${slot}` survived the whole
+// suite -- two accounts in one slot then share one credential.
+describeSecretsContract("fake secrets", () => createFakeSecrets());
+describeSecretsContract("web secrets", () => createWebSecrets());
+
+// The TimePort had no test file and no contract, and scored 3 of 3 surviving
+// in a mutation sweep -- the worst module in the package. Both implementations
+// run the same cases: the fake driven by its own clock, the web adapter on
+// real timers.
+describeTimeContract("fake time", () => createFakeTime(), async (time, ms) => {
+  const fake = time as ReturnType<typeof createFakeTime>;
+  fake.advance(ms);
+  fake.tick();
+  fake.releaseFrames();
+  // A fake timer fires when the test says so; a real one fires on its own.
+  for (const scheduler of fake.schedulers) {
+    if (scheduler.timerArmed) scheduler.fireTimer();
+  }
+  await Promise.resolve();
+});
+
+// The web adapter targets a browser, so the test supplies the one browser API
+// it needs. Without this `requestFrame` throws ReferenceError in Node and the
+// adapter cannot be contract-tested at all -- which is part of why it never
+// was.
+(globalThis as Record<string, unknown>)["requestAnimationFrame"] ??= (cb: () => void) =>
+  setTimeout(cb, 0);
+
+describeTimeContract(
+  "web time",
+  () => createWebTime(),
+  async (_time, ms) => { await new Promise((r) => setTimeout(r, ms + 10)); },
+  true,
+);
 
 // ---- the contract can fail ------------------------------------------------
 
@@ -220,6 +263,7 @@ interface BridgeProbe {
   readonly bridge: TauriBridge;
   emit(event: string, payload: unknown): void;
   readonly invocations: ReadonlyArray<{ command: string; args: Record<string, unknown> }>;
+  readonly opened: readonly string[];
   /** How many NATIVE listeners exist, as opposed to app subscribers. */
   nativeListenerCount(): number;
 }
@@ -227,6 +271,9 @@ interface BridgeProbe {
 function probeBridge(options: { readonly slowListen?: boolean } = {}): BridgeProbe {
   const listeners = new Map<string, Set<(payload: unknown) => void>>();
   const invocations: Array<{ command: string; args: Record<string, unknown> }> = [];
+  /** What `openExternal` actually handed the OS. Nothing read this before, so
+   *  a shell could validate one string and forward a different one. */
+  const opened: string[] = [];
   return {
     bridge: {
       isPresent: () => true,
@@ -243,7 +290,7 @@ function probeBridge(options: { readonly slowListen?: boolean } = {}): BridgePro
           ? new Promise((resolve) => void queueMicrotask(() => resolve(unsubscribe)))
           : Promise.resolve(unsubscribe);
       },
-      openExternal: () => Promise.resolve(true),
+      openExternal: (url: string) => { opened.push(url); return Promise.resolve(true); },
       haptic: () => Promise.resolve(true),
       share: () => Promise.resolve(true),
     },
@@ -251,6 +298,7 @@ function probeBridge(options: { readonly slowListen?: boolean } = {}): BridgePro
       for (const handler of [...(listeners.get(event) ?? [])]) handler(payload);
     },
     invocations,
+    opened,
     nativeListenerCount: () => [...listeners.values()].reduce((n, set) => n + set.size, 0),
   };
 }
@@ -264,6 +312,7 @@ function fakeHarness(): ShellHarness {
     emitKeyboardHeight: (px) => fake.setKeyboardHeight(px),
     emitLifecycle: (phase) => fake.setLifecycle(phase),
     listenerCount: () => fake.listenerCount(),
+    forwarded: () => fake.opened,
   };
 }
 
@@ -289,6 +338,7 @@ function tauriHarness(): ShellHarness {
     emitKeyboardHeight: (px) => probe.emit("keyboard-height", px),
     emitLifecycle: (phase) => probe.emit("lifecycle", phase),
     listenerCount: () => shell.listenerCount(),
+    forwarded: () => probe.opened,
   };
 }
 
@@ -309,8 +359,85 @@ function webHarness(): ShellHarness {
       else fake.setHidden(false);
     },
     listenerCount: () => shell.listenerCount(),
+    forwarded: () => fake.opened,
   };
 }
+
+test("the tauri shell forwards the URL it validated, not the one it was given", () => {
+  // `url.trim()` -> `url` survived every contract case, because a contract can
+  // only observe REJECTION and the allowlist tolerates padding either way. What
+  // changes is what reaches the OS: a URL validated in one form and forwarded
+  // in another is the shape of a scheme-confusion bypass, and nothing in the
+  // suite read what the bridge was handed.
+  const probe = probeBridge();
+  const shell = createTauriShell({ bridge: probe.bridge, insetSource: cssSource({}) });
+
+  return shell.openExternal("  https://ok.example/path  ").then(() => {
+    assert.deepEqual(
+      probe.opened,
+      ["https://ok.example/path"],
+      "the OS must receive the trimmed URL the allowlist actually approved",
+    );
+  });
+});
+
+test("a native safe-area payload carrying only the edges that moved is honoured", () => {
+  // `coerceInsets`'s guard is "return null only if EVERY edge is absent"
+  // (`&&`). Flipping it to `||` -- require all four -- survived, because the
+  // shared contract can only emit a FULL SafeAreaInsets; the harness has no way
+  // to express a partial payload, so nothing could reach this branch.
+  //
+  // A native side that sends only what changed would have every event
+  // discarded, and the insets would stay at whatever the first CSS read gave
+  // them: the composer sits under the home indicator for the life of the app.
+  const probe = probeBridge();
+  const shell = createTauriShell({ bridge: probe.bridge, insetSource: cssSource({}) });
+
+  probe.emit("safe-area-changed", { bottom: 34 });
+  assert.equal(shell.insets.bottom, 34, "a partial payload must be applied, not discarded");
+
+  probe.emit("safe-area-changed", { top: 47 });
+  assert.equal(shell.insets.top, 47);
+});
+
+test("a safe-area event with no edges at all falls back to the CSS snapshot", () => {
+  // The pair, and the reason the guard exists: an empty or unrecognised
+  // payload means "re-read the CSS", not "every inset is zero". Returning
+  // zeroes instead slides the composer under the home indicator.
+  const probe = probeBridge();
+  const shell = createTauriShell({
+    bridge: probe.bridge,
+    insetSource: cssSource({ "--safe-area-inset-bottom": "34px" }),
+  });
+
+  probe.emit("safe-area-changed", {});
+  assert.equal(shell.insets.bottom, 34, "an empty payload must not zero the insets");
+});
+
+test("the tauri shell does not republish an unchanged safe-area payload", () => {
+  // Dropping `right` from `sameInsets` survived, and so did removing the whole
+  // comparison. This is a Tauri-only optimisation -- the fake and web shells
+  // republish -- so it belongs here rather than in the shared contract, which
+  // is why nothing covered it.
+  //
+  // Without the dedupe, every frame of a rotation relayouts. With `right`
+  // missing from it, a landscape notch appearing on the right is deduped away
+  // as "no change" and content sits under it.
+  const probe = probeBridge();
+  const shell = createTauriShell({ bridge: probe.bridge, insetSource: cssSource({}) });
+
+  probe.emit("safe-area-changed", { top: 47, right: 0, bottom: 34, left: 0 });
+  let published = 0;
+  const stop = shell.onInsetsChanged(() => void published++);
+
+  probe.emit("safe-area-changed", { top: 47, right: 0, bottom: 34, left: 0 });
+  assert.equal(published, 0, "an identical payload must not republish");
+
+  probe.emit("safe-area-changed", { top: 47, right: 44, bottom: 34, left: 0 });
+  assert.equal(published, 1, "a change on the right edge alone must publish");
+  assert.equal(shell.insets.right, 44);
+  stop();
+});
 
 describeShellContract("fake shell", fakeHarness);
 describeShellContract("tauri shell", tauriHarness);
@@ -879,4 +1006,295 @@ test("the shared names are the env() spellings a stylesheet can mirror", () => {
     "--safe-area-inset-bottom",
     "--safe-area-inset-left",
   ]);
+});
+
+test("the web shell reports a keyboard that is ALREADY up at construction", async () => {
+  // The case the synchronous property exists for, and the one it did not
+  // actually cover: it was declared `= 0` and only ever updated by an event.
+  // A component mounting during a warm resume, or with a hardware keyboard
+  // already present, laid out at 0 for one frame and then jumped -- which is
+  // precisely the bug the snapshot was added to prevent.
+  const fake = createFakeWindow();
+  fake.setKeyboardHeight(336);           // up BEFORE the shell is constructed
+  assert.equal(createWebShell(fake.window).keyboardHeightPx, 336);
+});
+
+test("the web shell reports 0 when no keyboard is up", async () => {
+  // The pair: seeding from a wrong source, or always reporting a height, would
+  // hold the composer permanently off the bottom of the screen.
+  const fake = createFakeWindow();
+  assert.equal(createWebShell(fake.window).keyboardHeightPx, 0);
+});
+
+test("a page opened pinch-zoomed is not mistaken for a keyboard at construction", async () => {
+  // Pinch-zoom shrinks the visual viewport exactly as a keyboard does, so the
+  // bare `innerHeight - viewport.height` seed would report a phantom keyboard
+  // on the first frame and push the composer up. `scale > 1` is what separates
+  // zoom from a keyboard. Reverting the guard makes this fail with a positive
+  // height.
+  const fake = createFakeWindow();
+  fake.setZoom(2);                       // zoomed BEFORE the shell is constructed
+  assert.equal(createWebShell(fake.window).keyboardHeightPx, 0);
+});
+
+test("zooming after construction does not report a phantom keyboard", async () => {
+  // The live path reads through the same function, so the guard holds for every
+  // frame and not just the first one.
+  const fake = createFakeWindow();
+  const shell = createWebShell(fake.window);
+  const seen: number[] = [];
+  shell.onKeyboardHeightChanged((px) => void seen.push(px));
+  fake.setZoom(2);
+  assert.equal(shell.keyboardHeightPx, 0);
+  assert.deepEqual(seen, [0]);
+});
+
+// ---- (3) the contracts can FAIL --------------------------------------------
+//
+// The "the contract catches an adapter that ..." tests above build a broken
+// adapter and then RE-IMPLEMENT the contract's assertion inline. That proves
+// an assertion of that shape would catch the defect. It proves nothing about
+// whether the contract still contains it.
+//
+// Measured: deleting `assert.ok(fired >= 2)` from the time contract -- the one
+// assertion catching `setInterval` becoming `setTimeout`, which stops every
+// polling loop in the app after a single tick -- left the suite at 1035 pass,
+// 0 fail. Fourteen assertions across all four contracts could be deleted for
+// free, and removing a whole section merely reported one test fewer.
+//
+// These spawn the REAL contract against a deliberately broken adapter and
+// assert the matching case goes red BY NAME. The identical pattern already
+// existed in engines/src/contract-fixture.ts, written for the same reason; the
+// adapter contracts never got it.
+
+function adapterChildEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env["NODE_TEST_CONTEXT"];
+  return env;
+}
+
+function runAdapterFixture(mode: string): { status: number | null; output: string } {
+  const here = dirname(fileURLToPath(import.meta.url));
+  // The reporter is FORCED: node 22 emits TAP when stdout is a pipe, node 24
+  // emits the spec reporter, and a test grepping for "not ok" would pass on
+  // one and fail on the other with identical code under it.
+  const run = spawnSync(
+    process.execPath,
+    ["--test-reporter=tap", join(here, "contract-fixture.ts"), mode],
+    { encoding: "utf8", timeout: 120_000, env: adapterChildEnv() },
+  );
+  return { status: run.status, output: `${run.stdout ?? ""}${run.stderr ?? ""}` };
+}
+
+/** Each break mode, and the contract case that must go red because of it. */
+const ADAPTER_BREAKS: readonly { readonly mode: string; readonly expects: RegExp }[] = [
+  { mode: "secrets_slot_only", expects: /two ACCOUNTS in one slot are two different secrets/ },
+  { mode: "secrets_empty_is_absent", expects: /an empty string is a stored value, not an absence/ },
+  { mode: "storage_missing_is_undefined", expects: /a missing key reads as null, never undefined/ },
+  { mode: "storage_namespaces_collide", expects: /namespaces are isolated/ },
+  { mode: "time_every_fires_once", expects: /every\(\) repeats, rather than firing once/ },
+  { mode: "time_clear_does_nothing", expects: /a cleared timer does not fire/ },
+  // The shell contract is the largest of the four and was the one this fixture
+  // did not register. A re-measure proved every assertion in it deletable, the
+  // whole security section removable, and the entire contract replaceable with
+  // `assert.ok(shell)` -- green every time.
+  { mode: "shell_opens_anything", expects: /a javascript: URL is refused/ },
+  { mode: "shell_back_in_registration_order", expects: /the most recently registered back handler gets first refusal/ },
+  { mode: "shell_listener_count_stuck", expects: /unsubscribing drops the live listener count/ },
+  // The count floor catches a DELETED case; it cannot catch a case that still
+  // exists and asserts nothing. A sweep found seven assertions that could be
+  // hollowed out with a green build. One break mode per hollowable case is
+  // what closes that, because a mode reddens the case BY NAME.
+  { mode: "storage_empty_is_absent", expects: /an empty string is a value, not an absence/ },
+  { mode: "time_unsubscribe_does_nothing", expects: /the unsubscribe actually stops it/ },
+  { mode: "shell_scheme_case_sensitive", expects: /an uppercase JAVASCRIPT: URL is refused/ },
+  { mode: "shell_negative_insets", expects: /no inset is negative/ },
+];
+
+for (const { mode, expects } of ADAPTER_BREAKS) {
+  test(`the contracts can fail: "${mode}" reddens its own named case`, () => {
+    const { status, output } = runAdapterFixture(mode);
+    assert.notEqual(status, 0, `the fixture passed while broken as "${mode}"`);
+
+    // The `not ok ` prefix is part of the PATTERN, not just of a filter applied
+    // before it. Filtering and then matching separately meant that neutering
+    // the filter let a PASSING line -- "ok 12 - a javascript: URL is refused"
+    // -- satisfy the assertion, so the meta-test went green precisely when the
+    // contract stopped catching anything. Requiring the prefix in the match
+    // itself means the line has to actually be a failure.
+    const failed = new RegExp(`^not ok .*${expects.source}`);
+    const matched = output.split("\n").some((line) => failed.test(line));
+    assert.ok(matched, `"${mode}" did not fail the case it is supposed to:\n${output}`);
+  });
+}
+
+test("a contract cannot quietly shrink", () => {
+  // The remaining hole after the break modes above: they prove a case still
+  // WORKS, but a case with no break mode could simply be deleted and nothing
+  // would say so. Measured before this: removing an entire section of the time
+  // contract left the run reporting one test fewer and zero failures.
+  //
+  // The floor is counted from a REAL run rather than from the source text --
+  // this repo's rule is to assert on behaviour, and a regex over `test(` would
+  // be satisfied by a case that asserts nothing.
+  //
+  // Raise these numbers when you add cases. If one drops, a contract lost
+  // coverage, and that is exactly the event worth a red build.
+  const { status, output } = runAdapterFixture("none");
+  assert.equal(status, 0, `the unbroken fixture failed:\n${output}`);
+
+  // `# SKIP` and `# TODO` are reported as `ok` in TAP, so counting them lets a
+  // case be disabled rather than deleted and the floor never notices. Measured:
+  // changing `test(` to `test.skip(` on a security case kept the run green.
+  const passed = output
+    .split("\n")
+    .filter((line) => line.startsWith("ok ") && !/#\s*(SKIP|TODO)/i.test(line));
+  const casesFor = (prefix: string): number =>
+    passed.filter((line) => line.includes(`fixture ${prefix}:`)).length;
+
+  assert.ok(casesFor("secrets") >= 9, `the secrets contract shrank to ${casesFor("secrets")} cases`);
+  assert.ok(casesFor("storage") >= 11, `the storage contract shrank to ${casesFor("storage")} cases`);
+  assert.ok(casesFor("time") >= 8, `the time contract shrank to ${casesFor("time")} cases`);
+  assert.ok(casesFor("shell") >= 37, `the shell contract shrank to ${casesFor("shell")} cases`);
+
+  // The break table needs a floor of its own. Deleting a row from
+  // ADAPTER_BREAKS, or lowering a count above, removes a defence and the only
+  // signal is a smaller number that nothing reads. Guarding the guard.
+  assert.ok(
+    ADAPTER_BREAKS.length >= 13,
+    `the break table shrank to ${ADAPTER_BREAKS.length} modes`,
+  );
+});
+
+test("the contracts can PASS: an unbroken fixture is green", () => {
+  // The control. Without it, a fixture that failed everything -- a syntax
+  // error, a missing import, a runner that cannot start -- would satisfy every
+  // case above while proving nothing at all.
+  const { status, output } = runAdapterFixture("none");
+  assert.equal(status, 0, `an unbroken fixture failed:\n${output}`);
+});
+
+test("the tauri bridge subscribes to events for ANY target", () => {
+  // Nothing asserted the arguments handed to `internals.invoke`, so the
+  // `listen` payload's `target: { kind: "Any" }` could be changed to
+  // `{ kind: "Window" }` -- or removed entirely -- and stay green. On a device
+  // that is "the app stops receiving safe-area, keyboard, lifecycle and back
+  // events", with no error anywhere.
+  //
+  // The previous hardening covered `openExternal`'s call site and missed this
+  // one: same file, same commit, a different invoke.
+  const calls: { command: string; args: Record<string, unknown> }[] = [];
+  const internals = {
+    invoke: (command: string, args: Record<string, unknown>) => {
+      calls.push({ command, args });
+      return Promise.resolve(1);
+    },
+    transformCallback: (cb: unknown) => {
+      void cb;
+      return 7;
+    },
+  };
+  const bridge = createTauriBridge({ scope: { __TAURI_INTERNALS__: internals } } as never);
+
+  return bridge.listen("safe-area-changed", () => {}).then(() => {
+    const listen = calls.find((c) => c.command === "plugin:event|listen");
+    assert.ok(listen, "no listen call was made");
+    assert.deepEqual(
+      listen.args["target"],
+      { kind: "Any" },
+      "an event subscription scoped to one window misses the events the app needs",
+    );
+    assert.equal(listen.args["event"], "safe-area-changed");
+    assert.equal(listen.args["handler"], 7, "the transformed callback id must be forwarded");
+  });
+});
+
+test("the tauri bridge opens links in a NEW context, with the opener severed", () => {
+  // Three independent survivors in one line of webOpen:
+  //   drop `open(url)` but keep `return true` -- reports success having opened
+  //     nothing, so tapping a link does nothing and the app believes it worked;
+  //   `"_blank"` -> `"_self"` -- the link REPLACES the running app;
+  //   `"noopener,noreferrer"` -> `""` -- the opened page keeps a live
+  //     `window.opener` back into the app, and the referrer leaks.
+  const opened: { url: string; target: string; features: string }[] = [];
+  const scope = {
+    open(url: string, target: string, features: string) {
+      opened.push({ url, target, features });
+      return null;
+    },
+  };
+  const bridge = createTauriBridge({ scope });
+
+  return bridge.openExternal("https://ok.example").then((result) => {
+    assert.equal(opened.length, 1, "openExternal must actually open something");
+    assert.equal(opened[0]?.url, "https://ok.example");
+    assert.equal(opened[0]?.target, "_blank", "a link must not replace the running app");
+    assert.match(opened[0]?.features ?? "", /noopener/, "the opener must be severed");
+    assert.match(opened[0]?.features ?? "", /noreferrer/);
+    assert.equal(result, true);
+  });
+});
+
+test("openExternal reports FAILURE when there is nothing to open with", () => {
+  // The pair. Returning true unconditionally is the defect above; returning
+  // false unconditionally would make every real link look broken.
+  const bridge = createTauriBridge({ scope: {} });
+  return bridge.openExternal("https://ok.example").then((result) => {
+    assert.equal(result, false);
+  });
+});
+
+test("the web storage adapter namespaces its keys", () => {
+  // `PREFIX = "praisonai."` -> `""` survived. Keys become `chats.c1` on the
+  // shared origin: they collide with anything else stored there, and every
+  // existing install's data becomes unreachable at the new key. The port
+  // contract cannot see this -- it only checks read-back through the same
+  // adapter, which is self-consistent either way.
+  const written = new Map<string, string>();
+  const backing = {
+    getItem: (k: string) => written.get(k) ?? null,
+    setItem: (k: string, v: string) => void written.set(k, v),
+    removeItem: (k: string) => void written.delete(k),
+    key: (i: number) => [...written.keys()][i] ?? null,
+    clear: () => written.clear(),
+    get length() { return written.size; },
+  } as unknown as Storage;
+
+  return createWebStorage(backing)
+    .write({ namespace: "chats", id: "c1" }, "body")
+    .then(() => {
+      const keys = [...written.keys()];
+      assert.equal(keys.length, 1);
+      assert.match(keys[0] ?? "", /^praisonai\./, `the key was not namespaced: ${keys[0]}`);
+      assert.match(keys[0] ?? "", /chats/);
+    });
+});
+
+test("the web shell re-pushes history after consuming a back gesture", () => {
+  // `pushState` -> `replaceState` survived. After the app consumes a back
+  // press, the browser's entry is replaced rather than restored -- so the NEXT
+  // back press exits the app instead of going one screen up. The user presses
+  // back twice and finds themselves out of the conversation.
+  const fake = createFakeWindow();
+  const shell = createWebShell(fake.window);
+  const stop = shell.onBackGesture(() => true);
+
+  const before = fake.pushed;
+  fake.popstate();
+  assert.ok(fake.pushed > before, "a consumed back gesture must restore the history entry it used");
+  stop();
+});
+
+test("a back gesture the app DECLINES does not touch history", () => {
+  // The pair. Pushing unconditionally traps the user on the page: the OS back
+  // gesture can never leave the app, which is the defect the root handler
+  // returning false exists to prevent.
+  const fake = createFakeWindow();
+  const shell = createWebShell(fake.window);
+  const stop = shell.onBackGesture(() => false);
+
+  const before = fake.pushed;
+  fake.popstate();
+  assert.equal(fake.pushed, before, "an unconsumed back must be allowed to navigate away");
+  stop();
 });

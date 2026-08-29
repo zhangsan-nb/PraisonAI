@@ -65,6 +65,19 @@ const RTL_SCRIPTS: ReadonlySet<string> = new Set([
 const RTL_LANGUAGES: ReadonlySet<string> = new Set([
   "ar", "arc", "az-arab", "ckb", "dv", "fa", "he", "ks", "ku-arab", "nqo",
   "pnb", "ps", "sd", "syr", "ug", "ur", "yi",
+  // Added after comparing this table against `Intl.Locale.textInfo` across a
+  // corpus: thirteen languages disagreed, all of them RTL by Intl and LTR
+  // here. Because this table is only consulted when `textInfo` is ABSENT, the
+  // gap was invisible on every host that could have revealed it, and rendered
+  // the whole UI the wrong way round on the older WebViews that reach it.
+  //
+  // Five spoken Arabic varieties, which are what a phone's locale actually
+  // reports in those regions rather than plain "ar":
+  "aeb", "acm", "ajp", "apc", "ary", "arz",
+  // Persian-script and Perso-Arabic languages:
+  "bal", "glk", "haz", "lrc", "mzn", "skr",
+  // Rohingya, whose Hanifi script is RTL:
+  "rhg",
 ]);
 
 /** Split a tag on either separator. A stored preference reaches us as "en_US"
@@ -110,7 +123,21 @@ function directionFromIntl(tag: string): Direction | null {
 }
 
 /** The fallback: an explicit script subtag if there is one, else the language. */
-function directionFromTables(tag: string): Direction {
+/**
+ * The table lookup, exported so a test can call it.
+ *
+ * `direction()` is `directionFromIntl(tag) ?? directionFromTables(tag)`, and
+ * the test host is a Node with full ICU where the first half always answers --
+ * so this half never ran under test. A mutation sweep found FIVE
+ * indistinguishable mutations in it: Arabic, Hebrew, Farsi and Urdu rendering
+ * LTR; `az-Arab` and `ku-Arab` rendering LTR; `ar-Latn` and `ks-Deva`
+ * rendering RTL.
+ *
+ * This is the branch that runs on an older Android WebView without
+ * `Intl.Locale.textInfo` -- exactly the devices most likely to be affected --
+ * and the failure is the whole UI mirrored the wrong way, or not at all.
+ */
+export function directionFromTables(tag: string): Direction {
   const parts = subtags(tag).map((part) => part.toLowerCase());
   const language = parts[0] ?? "";
 

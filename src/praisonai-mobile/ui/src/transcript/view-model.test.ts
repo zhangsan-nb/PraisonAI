@@ -23,7 +23,7 @@ import {
   type ToolRowView,
 } from "./view-model.ts";
 import { UNKNOWN, formatElapsed } from "../format.ts";
-import { apply, initialTurn, type TurnState } from "../../../core/src/run/transcript.ts";
+import { apply, initialTurn, noteDropped, type TurnState } from "../../../core/src/run/transcript.ts";
 import { add, choose, emptyApprovals } from "../../../core/src/run/approvals.ts";
 import type { RunEvent } from "../../../protocol/src/events.ts";
 import { SCRIPTS } from "../../../testing/src/scripts.ts";
@@ -46,8 +46,9 @@ const run = (...events: readonly RunEvent[]): TurnState =>
 const scripted = (name: keyof typeof SCRIPTS): TurnState =>
   (SCRIPTS[name] as readonly RunEvent[]).reduce<TurnState>(apply, initialTurn);
 
-/** One outstanding approval, NOT terminated: settle() clears approvals, so a
- *  script that reaches `end` has none left to render. */
+/** One outstanding approval, NOT terminated: while the turn is live the
+ *  approval is actionable. settle() keeps it but marks it resolved, so a turn
+ *  that reaches `end` renders it as history rather than a live prompt. */
 const pendingApproval = (): TurnState =>
   run(
     start,
@@ -214,6 +215,20 @@ test("an approval that has not been decided can be pressed", () => {
   const rows = approvalRowsOf(buildTranscript(pendingApproval()));
   assert.equal(rows[0]?.actionable, true);
   assert.equal(rows[0]?.state.status, "pending");
+});
+
+test("an approval kept from an ended turn is history, not a live prompt", () => {
+  // settle() KEEPS an unanswered approval and marks it resolved, but the
+  // decision table entry stays `pending`. Reading the table alone would leave
+  // the ended turn's buttons enabled -- letting a finished run submit and retry
+  // a decision it can no longer deliver. The row must be non-actionable even
+  // though its table entry still reads `pending`.
+  const ended = apply(pendingApproval(), endAt(0));
+  const table = add(emptyApprovals, { approvalId: "ap1", callId: "c1", name: "rm", args: {} });
+  const rows = approvalRowsOf(buildTranscript(ended, table));
+  assert.equal(rows.length, 1, "the approval is kept as history");
+  assert.equal(rows[0]?.state.status, "pending", "the decision table is still pending");
+  assert.equal(rows[0]?.actionable, false, "but the ended turn cannot act on it");
 });
 
 // -------------------------------------------------------------------- actions
@@ -421,4 +436,133 @@ test("a plain answer is still a single text row", () => {
   // The pair: the common case must not gain structure it does not need.
   const view = buildTranscript(run(start, delta("hello"), endAt(0)));
   assert.deepEqual(view.rows.map((r) => r.kind), ["text"]);
+});
+
+// ---- two approvals, and the join that must not become a zip ------------------
+
+test("each approval row carries ITS OWN decision, not the first one in the table", () => {
+  // approvalRow's own comment says "Looked up by approvalId in both -- never
+  // zipped by index". Replacing that lookup with `table.entries[0]` passed the
+  // entire suite, because every existing test has exactly ONE approval in
+  // flight, where the first entry and the right entry are the same object.
+  //
+  // With two outstanding, the second row renders the first row's state: a
+  // `rm -rf /` prompt shows as already-allowed with dead buttons, against a
+  // decision the user never made. This is the precise defect the approvalId
+  // design exists to prevent, reintroduced at the last hop before the DOM.
+  const turn = run(
+    start,
+    { type: "tool_call", msgId: M, callId: "c1", name: "ls", args: {} },
+    { type: "approval_request", msgId: M, approvalId: "ap1", callId: "c1", name: "ls", args: {} },
+    { type: "tool_call", msgId: M, callId: "c2", name: "rm", args: { path: "/" } },
+    { type: "approval_request", msgId: M, approvalId: "ap2", callId: "c2", name: "rm", args: { path: "/" } },
+  );
+
+  // Only the FIRST is decided. The second is still awaiting the user.
+  let table = add(emptyApprovals, { approvalId: "ap1", callId: "c1", name: "ls", args: {} });
+  table = add(table, { approvalId: "ap2", callId: "c2", name: "rm", args: { path: "/" } });
+  table = choose(table, "ap1", "allow");
+
+  const rows = buildTranscript(turn, table).rows.filter(
+    (r): r is ApprovalRowView => r.kind === "approval",
+  );
+  assert.equal(rows.length, 2, "both approvals should render");
+
+  const ls = approvalFor(rows, "c1");
+  const rm = approvalFor(rows, "c2");
+
+  assert.equal(ls.state.status, "sending", "the decided one carries its decision");
+  assert.equal(
+    rm.state.status,
+    "pending",
+    "the UNDECIDED rm -rf / must not inherit the ls decision",
+  );
+  assert.equal(rm.actionable, true, "and its buttons must still work");
+});
+
+test("an approval with no table entry renders pending rather than borrowing one", () => {
+  // The other direction of the same join. Falling back to any entry at all
+  // would attach a stranger's decision to a prompt that has none.
+  const turn = run(
+    start,
+    { type: "tool_call", msgId: M, callId: "c1", name: "ls", args: {} },
+    { type: "approval_request", msgId: M, approvalId: "ap1", callId: "c1", name: "ls", args: {} },
+  );
+  let table = add(emptyApprovals, { approvalId: "other", callId: "cX", name: "curl", args: {} });
+  table = choose(table, "other", "deny");
+
+  const rows = buildTranscript(turn, table).rows.filter(
+    (r): r is ApprovalRowView => r.kind === "approval",
+  );
+  assert.equal(rows[0]?.state.status, "pending");
+  assert.equal(rows[0]?.actionable, true);
+});
+
+// ---- the two numbers the dropped row and the actions actually report --------
+
+test("the dropped row reports how many were dropped, not just that some were", () => {
+  // `count: turn.dropped.length` -> `count: 1` survived. `reasons: []` was
+  // caught; the count was not. The whole reason this row carries a number is
+  // to distinguish one malformed frame from a stream that is mostly
+  // unparseable, and it always said "1".
+  let turn = run(start, delta("hi"));
+  turn = noteDropped(turn, "unknown_event", "a");
+  turn = noteDropped(turn, "unparseable_json", "b");
+  turn = noteDropped(turn, "unknown_event", "c");
+
+  const row = buildTranscript(turn).rows.find((r) => r.kind === "dropped");
+  assert.ok(row && row.kind === "dropped");
+  assert.equal(row.count, 3);
+  assert.deepEqual([...row.reasons].sort(), ["unknown_event", "unparseable_json"]);
+});
+
+test("Copy is not offered for a turn with nothing in it", () => {
+  // `copy: turn.text !== ""` -> `copy: true` survived. A Copy button on an
+  // empty answer copies an empty string and reports success -- an action that
+  // says it did something and did not.
+  const empty = run(start);
+  assert.equal(buildTranscript(empty).actions.copy, false);
+
+  const answered = run(start, delta("something"));
+  assert.equal(buildTranscript(answered).actions.copy, true);
+});
+
+test("a multi-line tool output previews as ONE line", () => {
+  // Dropping `firstLine(...)` survived: the preview keeps its newlines and a
+  // one-line row renders as several, breaking the transcript's layout for
+  // every `ls`, every stack trace, every file read.
+  const turn = run(
+    start,
+    { type: "tool_call", msgId: M, callId: "c1", name: "ls", args: {} },
+    {
+      type: "tool_result", msgId: M, callId: "c1", name: "ls", ok: true,
+      output: "total 3\n-rw-r--r-- a.txt\n-rw-r--r-- b.txt", seconds: 0.1,
+    },
+  );
+  const row = buildTranscript(turn).rows.find((r) => r.kind === "tool");
+  assert.ok(row && row.kind === "tool");
+  assert.equal(row.preview.includes("\n"), false, `the preview spans lines: ${JSON.stringify(row.preview)}`);
+  assert.equal(row.preview, "total 3");
+  assert.match(row.output, /b\.txt/, "the full output is still carried for the expanded view");
+});
+
+test("an empty text block never becomes a message bubble", () => {
+  // `if (block.text === "") continue;` removed survived. An empty bubble is
+  // exactly what the file's own comment forbids -- it "makes a failure look
+  // like a short answer". A turn whose text block was closed by a tool call
+  // before any delta arrived renders one.
+  // `decode` rejects an empty delta, but `apply` is a public reducer and does
+  // not -- so an engine adapter that does not go through decode can produce
+  // exactly this state.
+  let turn = run(start);
+  turn = apply(turn, { type: "delta", msgId: M, text: "" });
+  turn = apply(turn, { type: "tool_call", msgId: M, callId: "c1", name: "bash", args: {} });
+  turn = apply(turn, { type: "delta", msgId: M, text: "after the tool" });
+
+  const textRows = buildTranscript(turn).rows.filter((r) => r.kind === "text");
+  assert.equal(
+    textRows.some((r) => r.kind === "text" && r.text === ""),
+    false,
+    `an empty bubble was rendered: ${JSON.stringify(textRows.map((r) => r.kind === "text" && r.text))}`,
+  );
 });

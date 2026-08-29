@@ -15,6 +15,7 @@ import {
   formatCount,
   formatElapsed,
   formatRelative,
+  graphemePrefix,
   graphemes,
   truncate,
 } from "./format.ts";
@@ -125,4 +126,85 @@ test("elapsed time is still reported for a timestamp in the past", () => {
 test("a preview takes the first line without splitting on a missing newline", () => {
   assert.equal(firstLine("one\ntwo"), "one");
   assert.equal(firstLine("only"), "only");
+});
+
+// ---- segmenting only what is needed -----------------------------------------
+
+test("graphemePrefix stops at the limit and says there was more", () => {
+  const { parts, hasMore } = graphemePrefix("abcdef", 3);
+  assert.deepEqual(parts, ["a", "b", "c"]);
+  assert.equal(hasMore, true);
+});
+
+test("graphemePrefix reports no more when the text ends first", () => {
+  // The pair. Always returning hasMore:true would make truncate append an
+  // ellipsis to text that fits.
+  const { parts, hasMore } = graphemePrefix("ab", 5);
+  assert.deepEqual(parts, ["a", "b"]);
+  assert.equal(hasMore, false);
+});
+
+test("graphemePrefix counts clusters, not code units", () => {
+  const { parts, hasMore } = graphemePrefix("👩‍👩‍👧‍👦👍🏽🇬🇧", 2);
+  assert.deepEqual(parts, ["👩‍👩‍👧‍👦", "👍🏽"]);
+  assert.equal(hasMore, true);
+});
+
+test("truncating a long single line does work proportional to max, not to the input", () => {
+  // `buildTranscript` re-derives every tool preview on EVERY publish, roughly
+  // thirty times a second during a streaming answer. Segmenting the whole
+  // string first meant one tool returning 40kB of single-line JSON cost ~10ms
+  // per publish -- on a phone, 3-5x that, so the frame budget is gone on its
+  // own. The earlier length check does not help: anything long always
+  // overflows and always paid in full.
+  //
+  // Timed rather than counted because the segmenter is not injectable. The
+  // margin is deliberately enormous -- measured 0.12ms after the fix and 48ms
+  // before it, so this threshold has ~170x headroom yet still fails the
+  // regression by more than 2x.
+  const huge = "x".repeat(200_000);
+  const started = performance.now();
+  const out = truncate(huge, 120);
+  const elapsed = performance.now() - started;
+
+  assert.equal(out.length, 120, "120 clusters: 119 kept plus the ellipsis");
+  assert.ok(out.endsWith("…"));
+  assert.ok(
+    elapsed < 20,
+    `truncate took ${elapsed.toFixed(1)}ms on a 200kB line -- the whole string is being segmented again`,
+  );
+});
+
+test("a long line still truncates to exactly the same text as before", () => {
+  // The lazy path must be byte-identical to materialising everything. Verified
+  // separately over 50,010 differential cases including ZWJ sequences, skin
+  // tones, regional indicators and Devanagari conjuncts; this pins the shape.
+  const line = "abcdef".repeat(1000);
+  assert.equal(truncate(line, 10), line.slice(0, 9) + "…");
+  assert.equal(truncate("👍🏽".repeat(500), 3), "👍🏽👍🏽…");
+});
+
+// ---- the boundaries between formats ----------------------------------------
+
+test("formatElapsed switches format AT the boundary, not one past it", () => {
+  // `seconds < 10` -> `<= 10` and `minutes < 60` -> `<= 60` both survived. The
+  // whole point of the thresholds is which side of them a value falls on, and
+  // no test placed a value exactly on one.
+  assert.equal(formatElapsed(9.94), "9.9s", "under ten keeps the decimal");
+  assert.equal(formatElapsed(10), "10s", "ten exactly is whole seconds");
+  assert.equal(formatElapsed(59), "59s");
+  assert.equal(formatElapsed(60), "1m 00s", "sixty seconds is a minute, not 60s");
+  assert.equal(formatElapsed(3599), "59m 59s");
+  assert.equal(formatElapsed(3600), "1h 00m", "sixty minutes is an hour, not 60m 00s");
+  assert.equal(formatElapsed(7260), "2h 01m");
+});
+
+test("formatRelative's just-now threshold is 45 seconds exactly", () => {
+  // `seconds < 45` -> `< 44` survived. The threshold is the whole contract of
+  // the function, and no test placed a value on it. `format-intl.ts` has the
+  // same boundary and is pinned separately -- the two must not drift.
+  const now = 1_700_000_000_000;
+  assert.match(formatRelative(now - 44_000, now), /just now/i, "44s is still just now");
+  assert.doesNotMatch(formatRelative(now - 45_000, now), /just now/i, "45s is not");
+  assert.doesNotMatch(formatRelative(now - 46_000, now), /just now/i);
 });

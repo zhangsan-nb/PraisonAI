@@ -13,10 +13,12 @@
  */
 import type { AgentEnginePort } from "../../core/src/ports/agent-engine.ts";
 import type { HttpPort } from "../../core/src/ports/http.ts";
+import type { IgnoredReason } from "../../protocol/src/decode.ts";
 import type { SettingDef, SettingsFacade } from "../../core/src/settings/store.ts";
 import { clampNum } from "../../core/src/settings/store.ts";
 import { createRemoteHttpEngine } from "../../engines/src/remote-http/engine.ts";
 import type { EngineChoice } from "./engines.ts";
+import type { RunPersistence } from "../../engines/src/praisonai-ts/engine.ts";
 
 export const ENGINE_REMOTE_HTTP = "remote-http";
 export const ENGINE_PRAISONAI_TS = "praisonai-ts";
@@ -38,7 +40,13 @@ export const SETTING_DEFS: readonly SettingDef[] = [
     label: "Engine",
     help: "Which agent runtime answers. Remote talks to a PraisonAI engine over HTTP; in-process runs the agent loop on this device.",
     section: "Engine",
-    choices: [ENGINE_REMOTE_HTTP, ENGINE_PRAISONAI_TS],
+    // Only what `enginesFor` can actually build in the shipping composition.
+    // ENGINE_PRAISONAI_TS was listed here and is only pushed when
+    // `createInProcess` is supplied, which main.ts does not do -- so selecting
+    // it persisted an id `selectEngine` then rejects, and the NEXT launch died
+    // at `renderFatal` with no way back except editing storage by hand. A
+    // picker must not offer a choice that bricks the app.
+    choices: [ENGINE_REMOTE_HTTP],
   },
   {
     key: "baseUrl",
@@ -69,6 +77,15 @@ export const SETTING_DEFS: readonly SettingDef[] = [
     section: "Display",
   },
   {
+    // NOT YET CONSUMED, and unlike its neighbours this one contradicts what
+    // the app actually does: the dropped row is rendered unconditionally
+    // (ui/src/transcript/view-model.ts), so the `false` default describes a
+    // hiding that does not happen. Left declared rather than deleted because
+    // the row SHOULD be gated once a settings screen exists -- but the gate
+    // must default to showing, since a diagnostic nobody can find is the same
+    // as no diagnostic. `model`, `temperature` and `showReasoning` are also
+    // declared ahead of their consumers; the difference is that they make no
+    // claim about behaviour that already exists.
     key: "showDiagnostics",
     default: false,
     label: "Show dropped events",
@@ -101,7 +118,24 @@ export interface RegistryDeps {
    * means the app builds and runs today with the remote engine, and gains the
    * in-process one by passing a factory rather than by a refactor.
    */
-  readonly createInProcess?: () => AgentEnginePort | Promise<AgentEnginePort>;
+  readonly createInProcess?: (persistence: RunPersistence) => AgentEnginePort | Promise<AgentEnginePort>;
+  /**
+   * Where a completed turn is written.
+   *
+   * Passed to the in-process engine, which is what makes `end.userIndex` real:
+   * the engine records the turn and reports the indices it actually wrote.
+   * Without this the session existed, the engine's `persistence` port existed,
+   * and NOTHING connected them -- so `record()` never ran in a real turn and no
+   * conversation was ever saved.
+   *
+   * The remote engine deliberately does not take it: the server it talks to
+   * persists, and it is the only thing that can report indices for its own
+   * store. Two engines, two owners of the write, one honest `userIndex`.
+   */
+  readonly persistence: RunPersistence;
+  /** Called for every frame an engine's decoder refuses. Supplied by the
+   *  composition root, which owns the transcript those refusals land on. */
+  readonly onIgnored?: (reason: IgnoredReason, detail: string) => void;
 }
 
 function stringSetting(settings: SettingsFacade, key: string, fallback: string): string {
@@ -126,12 +160,15 @@ export function enginesFor(deps: RegistryDeps): readonly EngineChoice[] {
           baseUrl: stringSetting(deps.settings, "baseUrl", "http://127.0.0.1:8765").replace(/\/+$/, ""),
           http: deps.http,
           id: ENGINE_REMOTE_HTTP,
+          // Refused frames go to the transcript instead of the floor.
+          ...(deps.onIgnored === undefined ? {} : { onIgnored: deps.onIgnored }),
         }),
     },
   ];
 
   if (deps.createInProcess !== undefined) {
-    choices.push({ id: ENGINE_PRAISONAI_TS, create: deps.createInProcess });
+    const build = deps.createInProcess;
+    choices.push({ id: ENGINE_PRAISONAI_TS, create: () => build(deps.persistence) });
   }
   return choices;
 }

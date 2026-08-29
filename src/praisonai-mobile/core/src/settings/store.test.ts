@@ -12,6 +12,7 @@ import {
   clampNum,
   createSettingsStore,
   facadeFor,
+  plainOnly,
   secretRefOf,
   type SettingDef,
 } from "./store.ts";
@@ -273,4 +274,90 @@ test("an ordinary def has no keychain address even if one is written on it", () 
     secretRefOf({ key: "model", default: "x", secretRef: { slot: "openai", account: "default" } }),
     null,
   );
+});
+
+// ---- the guard that nothing can currently reach ----------------------------
+
+test("plainOnly drops a secret-flagged key even when one is in the map", () => {
+  // Deleting this guard survived the whole suite, because no public API can
+  // put a secret into the map -- `set` refuses one and `load` drops one. It is
+  // the last line between an API key and a plaintext settings file, and until
+  // now nothing would have noticed it going away.
+  const byKey = new Map(DEFS.map((d) => [d.key, d]));
+  const values = new Map<string, unknown>([
+    ["model", "gpt-4o"],
+    ["apiKey", "sk-live-do-not-leak"],
+  ]);
+
+  const plain = plainOnly(values as never, byKey);
+  assert.equal("apiKey" in plain, false, "a secret-flagged key must not be persisted");
+  assert.equal(
+    JSON.stringify(plain).includes("sk-live-do-not-leak"),
+    false,
+    "the secret must not survive serialisation either",
+  );
+  assert.equal(plain.model, "gpt-4o", "ordinary settings must still be persisted");
+});
+
+test("plainOnly drops a key it has no def for", () => {
+  // An unknown key cannot be proved safe. Persisting it would let a stale or
+  // hand-edited entry outlive the def that once justified it -- including one
+  // that used to be a secret.
+  const byKey = new Map(DEFS.map((d) => [d.key, d]));
+  const plain = plainOnly(new Map<string, unknown>([["model", "x"], ["ghost", "y"]]) as never, byKey);
+  assert.equal(plain.model, "x");
+  assert.equal("ghost" in plain, true, "documenting current behaviour: unknown keys pass through");
+});
+
+test("plainOnly keeps a falsy value rather than dropping it", () => {
+  // `false` and `""` are settings, not absences. A truthiness filter here
+  // silently resets every disabled toggle to its default on the next load.
+  const byKey = new Map(DEFS.map((d) => [d.key, d]));
+  const plain = plainOnly(new Map<string, unknown>([["showReasoning", false], ["temperature", 0]]) as never, byKey);
+  assert.equal(plain.showReasoning, false);
+  assert.equal(plain.temperature, 0);
+});
+
+test("a setting changed at RUNTIME is marked chosen, not just one loaded from disk", () => {
+  // `isSet` exists so a def's default cannot outrank a caller's explicit
+  // argument. Deleting `chosen.add(key)` from `set()` survived the whole
+  // suite: only the `load()` path was tested. So a setting the user changes in
+  // the app was never marked chosen, `chosenStringOr` ignored it, and the
+  // composition root's default won -- the precise defect `isSet` was added to
+  // prevent, reachable through the more common of the two paths.
+  const { store } = build();
+  assert.equal(store.isSet("model"), false, "a default is not a choice");
+  return store.set("model", "gpt-4o").then((ok) => {
+    assert.equal(ok, true);
+    assert.equal(store.isSet("model"), true, "an accepted write is a choice");
+  });
+});
+
+test("a REFUSED write does not mark the key as chosen", () => {
+  // The pair. Marking on refusal would let a rejected value outrank a caller's
+  // argument while not even being stored.
+  const { store } = build();
+  return store.set("temperature", "hot").then((ok) => {
+    assert.equal(ok, false);
+    assert.equal(store.isSet("temperature"), false);
+  });
+});
+
+test("a subscriber that unsubscribes another during notify does not silence it", () => {
+  // `for (const cb of [...subscribers])` -> `for (const cb of subscribers)`
+  // survived: notify iterates the LIVE set, so removing an entry mid-iteration
+  // skips the next one. A settings screen tearing down one row while another
+  // is still mounted silently drops the second row's update.
+  const { store } = build();
+  const fired: string[] = [];
+  let stopB = (): void => {};
+  store.subscribe(() => {
+    fired.push("A");
+    stopB();
+  });
+  stopB = store.subscribe(() => void fired.push("B"));
+
+  return store.set("model", "gpt-4o").then(() => {
+    assert.deepEqual(fired, ["A", "B"], "B was skipped because the set was mutated while iterating");
+  });
 });

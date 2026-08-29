@@ -136,3 +136,99 @@ test("a long streaming turn costs one update per publish", () => {
   }
   assert.equal(total, 200, "one op per publish -- the first insert plus 199 updates");
 });
+
+// ---- signatures must cover every field the row renders ----------------------
+
+test("an error row repaints when only its recovery changes", () => {
+  // `${row.recovery}` could be dropped from the signature and survive. The
+  // comment two lines above it says exactly why it is there -- "the same
+  // message can offer a different action once the engine reports a different
+  // kind" -- and nothing checked. The row would keep a Retry button after the
+  // engine reclassified the failure as one retrying cannot fix.
+  const base = {
+    kind: "error" as const,
+    id: "err",
+    errorKind: "transport" as const,
+    message: "the connection dropped",
+    tone: "failure" as const,
+  };
+  const first = reconcile(emptyRender, [{ ...base, recovery: "retry" as const }]);
+  const second = reconcile(first.next, [{ ...base, recovery: "settings" as const }]);
+
+  assert.deepEqual(
+    second.ops.map((o) => o.kind),
+    ["update"],
+    "a changed recovery must repaint the row",
+  );
+});
+
+test("a dropped row repaints when the reasons change but the count does not", () => {
+  // `${row.reasons.join(",")}` could be dropped and survive. Two refusals for
+  // different reasons look identical to a count, so the row would keep naming
+  // the wrong failure.
+  const first = reconcile(emptyRender, [
+    { kind: "dropped" as const, id: "dropped", count: 2, reasons: ["unknown_event"] },
+  ]);
+  const second = reconcile(first.next, [
+    { kind: "dropped" as const, id: "dropped", count: 2, reasons: ["unparseable_json"] },
+  ]);
+
+  assert.deepEqual(second.ops.map((o) => o.kind), ["update"]);
+});
+
+test("an unchanged error row still produces nothing", () => {
+  // The pair for both of the above: a signature that changed every time would
+  // pass them and repaint on every frame.
+  const row = {
+    kind: "error" as const,
+    id: "err",
+    errorKind: "transport" as const,
+    message: "same",
+    tone: "failure" as const,
+    recovery: "retry" as const,
+  };
+  const first = reconcile(emptyRender, [row]);
+  assert.deepEqual(reconcile(first.next, [row]).ops, []);
+});
+
+test("an approval row repaints when it stops being actionable", () => {
+  // `signatureOf` dropping `row.actionable` survived. When a turn ends with an
+  // unanswered approval, `settle()` marks it resolved: `actionable` flips
+  // true -> false while `state.status` stays "pending". With actionable out of
+  // the signature nothing changes, so NO update op is emitted and the three
+  // buttons stay painted as live on a finished run.
+  //
+  // The user then taps Allow on a run that can no longer deliver it.
+  const base = {
+    kind: "approval" as const,
+    id: "approval:a1",
+    approvalId: "a1",
+    callId: "c1",
+    name: "bash",
+    args: {},
+    state: { status: "pending" as const },
+  };
+  const first = reconcile(emptyRender, [{ ...base, actionable: true }]);
+  const second = reconcile(first.next, [{ ...base, actionable: false }]);
+
+  assert.deepEqual(
+    second.ops.map((o) => o.kind),
+    ["update"],
+    "a row that stopped being actionable must repaint",
+  );
+});
+
+test("an unchanged approval row still produces nothing", () => {
+  const row = {
+    kind: "approval" as const,
+    id: "approval:a1",
+    approvalId: "a1",
+    callId: "c1",
+    name: "bash",
+    args: {},
+    state: { status: "pending" as const },
+    actionable: true,
+  };
+  const first = reconcile(emptyRender, [row]);
+  assert.deepEqual(reconcile(first.next, [row]).ops, []);
+});

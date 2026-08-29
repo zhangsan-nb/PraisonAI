@@ -272,6 +272,16 @@ assert('sdk with tests ok', mg.missingTestsReason([
   { filename: 'src/praisonai-agents/a/b.py', additions: 3 },
   { filename: 'src/praisonai-agents/tests/test_x.py', additions: 10 },
 ]) === null);
+assert('ts sdk without tests', mg.missingTestsReason([
+  { filename: 'src/praisonai-ts/src/agent/simple.ts', additions: 5 },
+]) !== null);
+assert('ts sdk with tests ok', mg.missingTestsReason([
+  { filename: 'src/praisonai-ts/src/agent/simple.ts', additions: 5 },
+  { filename: 'src/praisonai-ts/tests/unit/agent/history-restore.test.ts', additions: 10 },
+]) === null);
+assert('touches ts sdk', mg.touchesSdk([{ filename: 'src/praisonai-ts/src/agent/simple.ts' }]));
+assert('final body requires sdk value table', mg.FINAL_CLAUDE_REVIEW_BODY.includes('| **SDK value** |'));
+assert('final body requires ts agents md', mg.FINAL_CLAUDE_REVIEW_BODY.includes('src/praisonai-ts/AGENTS.md'));
 
 // PR size
 assert('large PR blocked', mg.prSizeReasons([{ additions: 900 }]).length > 0);
@@ -299,5 +309,21 @@ assert('dispatch allowed when queue below cap', mg.mergeGateDispatchBlockedReaso
   labels: [],
   pendingRuns: 2,
 }) == null);
+
+// Pending count excludes workflow_run auto-dispatch probes (PR #4534)
+assert('workflow_run probes excluded from pending count', mg.countSubstantiveMergeGateRuns([
+  { event: 'workflow_dispatch' },
+  { event: 'workflow_run' },
+  { event: 'workflow_run' },
+]) === 1);
+assert('all-probe runs count as zero pending', mg.countSubstantiveMergeGateRuns([
+  { event: 'workflow_run' },
+  { event: 'workflow_run' },
+]) === 0);
+assert('substantive dispatches still counted', mg.countSubstantiveMergeGateRuns([
+  { event: 'workflow_dispatch' },
+  { event: 'schedule' },
+]) === 2);
+assert('countSubstantiveMergeGateRuns null-safe', mg.countSubstantiveMergeGateRuns(null) === 0);
 
 process.exit(failed ? 1 : 0);

@@ -20,7 +20,7 @@ use praisonai_desktop_core::engine_paths::{
     app_bundle, data_dir, python_candidates, resolve_engine, RealFs as PathFs,
 };
 use praisonai_desktop_core::supervisor::{self, Engine, StartError};
-use praisonai_desktop_core::venv_resolve::{venv_root_for_python, RealFs};
+use praisonai_desktop_core::venv_resolve::{spawn_env, venv_root_for_python, RealFs};
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 
@@ -310,11 +310,31 @@ fn engine_status(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> En
         Some(b) => std::env::set_var("PRAISONAI_APP_BUNDLE", b),
         None => std::env::remove_var("PRAISONAI_APP_BUNDLE"),
     }
+    // Resolve the environment the engine actually spawns with, rather than
+    // inheriting the shell's. An exported PYTHONHOME or PYTHONPATH would
+    // otherwise redirect the engine's stdlib or site-packages away from the
+    // venv the resolver just proved. Collect *after* setting
+    // PRAISONAI_APP_BUNDLE above so it survives the `env_clear` in `start`.
+    //
+    // `vars_os`, not `vars`: `vars` panics on any non-Unicode key or value,
+    // and with `panic = "abort"` in release that would take the whole app down
+    // before the engine ever started -- a single stray byte in the inherited
+    // environment (a locale-encoded value, a foreign tool's export) would abort
+    // startup. `spawn_env` only handles `String` anyway, so drop undecodable
+    // entries rather than aborting; a variable Python could not have received
+    // as UTF-8 is no loss.
+    let inherited: std::collections::BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
+    let spawn = venv_root_for_python(&python, &RealFs, Platform::current())
+        .map(|layout| spawn_env(&layout, &inherited, Platform::current()))
+        .unwrap_or(inherited);
     match supervisor::start(
         &python.display().to_string(),
         &layout.script.display().to_string(),
         Duration::from_secs(30),
         &shell_version,
+        &spawn,
     ) {
         Ok(engine) => {
             let port = engine.port;
@@ -372,6 +392,28 @@ fn breadcrumb(primary: bool) {
     }
 }
 
+/// Create the user data directory on the primary launch, before any window.
+///
+/// The first-run report was a clean machine where the window opened, the setup
+/// screen appeared, and yet `%APPDATA%\PraisonAI` never came into existence:
+/// the only code that made the directory was `provision_engine`, which runs
+/// only after the user clicks "Get started". So a fresh install that a user
+/// merely opened -- or a machine whose data folder was deleted to repair a
+/// corrupt state -- left no Roaming directory at all, indistinguishable to a
+/// clean-start check from a shell that never started. Making it here, on the
+/// primary path (a secondary never reaches `setup()`), means the directory
+/// exists the moment the app is running, whether or not provisioning has begun.
+/// Best effort: a shell must never fail to start because it could not create
+/// its data directory -- `engine_status` and `provision_engine` still create
+/// it later if this could not.
+fn ensure_data_dir() {
+    if let Some(dir) = user_data_dir() {
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            eprintln!("[praisonai] could not create {}: {e}", dir.display());
+        }
+    }
+}
+
 fn main() {
     // Before the single-instance guard can quit this process: a launch that
     // hands off to the primary and exits 0 must still leave a trace, or it is
@@ -414,6 +456,10 @@ fn main() {
             // exit by the guard before it gets here. So this is where the
             // primary honestly upgrades its own breadcrumb, with its own pid.
             breadcrumb(true);
+            // And where the primary makes its data directory exist, so a clean
+            // machine that is merely opened -- not yet provisioned -- has the
+            // Roaming folder it was reported to be missing.
+            ensure_data_dir();
             app.manage(AppState { engine: Mutex::new(None) });
             // Deliberately not `?`. On Linux the tray goes through
             // libappindicator, which is dlopen'd at first use and *panics* if
