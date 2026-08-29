@@ -205,3 +205,49 @@ test("acknowledge still promotes a decision that IS in flight", () => {
   table = choose(table, "ap1", "allow");
   assert.equal(find(acknowledge(table, "ap1"), "ap1")?.state.status, "sent");
 });
+
+test("acknowledging records the choice the user actually made", () => {
+  // `choice: entry.state.choice` -> `choice: "allow"` survived. An
+  // acknowledged DENY is then recorded as an allow: the row the user reads
+  // back says they permitted the thing they refused, and `outstanding` and the
+  // audit trail agree with it.
+  for (const choice of ["allow", "always", "deny"] as const) {
+    let table = add(emptyApprovals, { approvalId: "ap1", callId: "c1", name: "rm", args: {} });
+    table = choose(table, "ap1", choice);
+    table = acknowledge(table, "ap1");
+
+    const state = find(table, "ap1")?.state;
+    assert.equal(state?.status, "sent");
+    assert.equal(
+      state?.status === "sent" ? state.choice : null,
+      choice,
+      `an acknowledged ${choice} must be recorded as ${choice}`,
+    );
+  }
+});
+
+test("a decision the engine already CONFIRMED cannot be un-confirmed by a late failure", () => {
+  // `reject`'s `entry.state.status !== "sending"` guard could be dropped with a
+  // green suite. A late or duplicated failure then flips a settled approval
+  // back to an actionable prompt: the user already allowed `rm -rf /`, the
+  // engine already ran it, and the app asks again with live buttons.
+  // `acknowledge`'s identical guard was tested; `reject`'s was not.
+  const settled = acknowledge(choose(two(), "ap1", "allow"), "ap1");
+  assert.equal(find(settled, "ap1")?.state.status, "sent");
+
+  const late = reject(settled, "ap1", "connection reset");
+
+  assert.equal(find(late, "ap1")?.state.status, "sent", "a sent decision stays sent");
+  assert.equal(isActionable(find(late, "ap1")!), false, "and must not become tappable again");
+});
+
+test("a decision still in flight CAN fail -- the pair", () => {
+  // Without this, a `reject` that refused every transition would pass above and
+  // leave a genuinely failed decision looking as though it had been delivered.
+  const sending = choose(two(), "ap2", "deny");
+  assert.equal(find(sending, "ap2")?.state.status, "sending");
+
+  const failed = reject(sending, "ap2", "connection reset");
+  assert.equal(find(failed, "ap2")?.state.status, "failed");
+  assert.equal(isActionable(find(failed, "ap2")!), true, "the user must be able to answer again");
+});

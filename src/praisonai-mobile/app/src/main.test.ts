@@ -40,7 +40,7 @@ import { createFakeDom } from "../../testing/src/fake-dom.ts";
 import { createFakeShell, PHONE_INSETS } from "../../testing/src/fake-shell.ts";
 import { createFakeStorage } from "../../testing/src/fake-storage.ts";
 import { createFakeSecrets } from "../../testing/src/fake-secrets.ts";
-import { createFakeHttp, sseResponse } from "../../testing/src/fake-http.ts";
+import { createFakeHttp, sseResponse, streamOf } from "../../testing/src/fake-http.ts";
 import { mount } from "./main.ts";
 import type { Platform } from "./platform.ts";
 
@@ -552,5 +552,99 @@ test("the Send button's LABEL and its action agree", async () => {
   const live = button();
   assert.equal(live?.dataset["action"], "stop");
   assert.equal(live?.textContent, en.actionStop, "a streaming turn must READ Stop, not just behave as Stop");
+  app?.dispose();
+});
+
+test("an approval row shows the decision after the user answers it", async () => {
+  // `buildTranscript(view.turn, view.approvals)` -> dropping the second
+  // argument survived. The approval TABLE is where the decision lifecycle
+  // lives; without it the row is built from the turn alone and stays `pending`
+  // forever, so the user taps Deny and the card never acknowledges it.
+  const { dom, http, platform } = harness();
+  http.on("/approve/a1", () => ({ status: 200, headers: {}, body: streamOf(JSON.stringify({ ok: true })) }));
+  http.on("/chat", () =>
+    held([
+      ["start", { msg_id: "m1", run_id: "r1" }],
+      ["tool_call", { msg_id: "m1", call_id: "c1", name: "rm", args: { path: "/" } }],
+      ["approval_request", { msg_id: "m1", approval_id: "a1", call_id: "c1", name: "rm", args: { path: "/" } }],
+    ]),
+  );
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  submit(dom, "do it");
+  await settle(120);
+
+  const row = () => dom.find((n) => n.className.includes("row-approval"));
+  assert.ok(row(), "the approval row should be on screen");
+  assert.equal(row()?.dataset["state"], "pending");
+
+  const deny = dom.find((n) => n.dataset["choice"] === "deny");
+  assert.ok(deny, "no Deny button");
+  dom.click(deny);
+  await settle(120);
+
+  assert.notEqual(
+    row()?.dataset["state"],
+    "pending",
+    "the row must acknowledge the decision, not stay pending forever",
+  );
+  app?.dispose();
+});
+
+// ---- the accessibility wiring, which nothing had asserted -------------------
+//
+// A mutation audit found that `polite`'s aria-live was pinned and `assertive`'s
+// was not, that the transcript's NOT being a live region -- the catastrophe its
+// own comment describes -- was undefended, and that the composer's label could
+// go back to the regression the code comment records as fixed.
+
+test("the two live regions have the politeness each one is for", async () => {
+  // `assertive.setAttribute("aria-live", "assertive")` was removable, and
+  // could also be flipped to "polite". The assertive region carries approval
+  // prompts and errors: an approval BLOCKS the run, so waiting politely for
+  // the queue to drain is waiting for something that will not happen until
+  // the user answers. Only `polite`'s attribute had a test.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  const regions = dom.all().filter((n) => n.getAttribute("aria-live") !== null);
+  assert.deepEqual(
+    regions.map((n) => n.getAttribute("aria-live")).sort(),
+    ["assertive", "polite"],
+    "exactly one polite region and one assertive one",
+  );
+  for (const region of regions) {
+    assert.ok(region.className.includes("sr-only"), "a live region is not visible");
+  }
+  app?.dispose();
+});
+
+test("the transcript is NOT a live region", async () => {
+  // Nothing asserted this, and the consequence is written out in main.ts: the
+  // transcript is mutated on every publish, so aria-live here makes the reader
+  // restart on each token batch and no sentence is ever finished. A one-line
+  // addition away, and undetectable.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  const log = dom.find((n) => n.getAttribute("role") === "log");
+  assert.ok(log, "the transcript is a log");
+  assert.equal(log.getAttribute("aria-live"), null, "and must never also be a live region");
+  assert.equal(log.getAttribute("aria-label"), en.appName, "it must still be named");
+  app?.dispose();
+});
+
+test("the message field is labelled as the field, not as the button beside it", async () => {
+  // `input.setAttribute("aria-label", strings.composerLabel)` was removable
+  // and could be given the Send button's name -- which is the exact regression
+  // the line's own comment records: the composer announced as "Send, edit
+  // text".
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+
+  const box = dom.find((n) => n.tagName === "TEXTAREA");
+  assert.ok(box);
+  assert.equal(box.getAttribute("aria-label"), en.composerLabel);
+  assert.notEqual(box.getAttribute("aria-label"), en.actionSend, "not the button's name");
   app?.dispose();
 });
