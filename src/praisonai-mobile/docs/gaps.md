@@ -21,8 +21,10 @@ type AgentEvent =
 
 Protocol v2 has **eleven** events. The channel now carries tool calls and
 results, so this engine reports tool activity. What it still cannot carry is an
-approval request, reasoning, or usage — so the two approval conformance
-scenarios below are declared unsupported rather than faked.
+approval request, reasoning, or usage — so the `two_approvals` conformance
+scenario below is declared unsupported rather than faked. (`approval` is *not*
+unsupported: its case only decides an unknown id, which needs no approval
+channel — see the note under the table.)
 
 ### What that means per capability
 
@@ -52,13 +54,19 @@ indistinguishable from a normal answer — which is the exact defect protocol v2
 
 | Scenario | Reason |
 |---|---|
-| `approval` | `ApprovalManager` gates tool execution upstream but cannot reach the event channel |
-| `two_approvals` | same as `approval` |
+| `two_approvals` | `ApprovalManager` gates tool execution upstream but its prompt cannot reach the event channel, so two `approval_request` events cannot be emitted |
 
 `tool_ok`, `tool_failed` and `tool_unresolved` were listed here until upstream
 gained `tool_call`/`tool_result`; they are now produced and passing. The suite
 prints every remaining omission on each run, so a contract that quietly shrinks
 is visible in the output rather than silently green.
+
+`approval` was also listed here until it was confirmed dead: that case only
+asserts that deciding an *unknown* id returns `false`, which this engine's
+`decide()` always does — it needs no approval channel. Declaring it unsupported
+skipped a case that already passed, so it now runs. `capabilities.approvals`
+stays `false`: the engine still cannot *emit* an approval request, which is what
+`two_approvals` needs.
 
 ### Closing the remaining gap
 
@@ -344,55 +352,92 @@ It also used to omit **route→view dispatch**, which the body of this file list
 as open and which is still open; dropping it from the closing line implied it
 had landed.
 
-## The publish gate is wired and unreachable
+## The publish gate was wired and unreachable — CLOSED
 
 `core/src/pacing/publish-gate.ts` is a verbatim port of the desktop's
 stream-pacing, with two constants tightened deliberately for mobile
-(`MAX_HELD_CHARS = 96`, `UNPAINTED_REOPEN_MS = 200`). It IS called --
-`controller.ts` has `if (frames.length > 0 && gate(streamed)) publish()` -- but
-in the shipped pipeline that condition is almost never true, so neither
-constant affects anything.
+(`MAX_HELD_CHARS = 96`, `UNPAINTED_REOPEN_MS = 200`). It WAS called --
+`controller.ts` had `if (frames.length > 0 && gate(streamed)) publish()` -- but
+in the shipped pipeline that condition was almost never true, so neither
+constant affected anything.
 
-The reason is the coalescer's flush tick, added to fix answers arriving in one
+The reason was the coalescer's flush tick, added to fix answers arriving in one
 lump. The tick drains the coalescer every `maxDelayMs`, so by the time a delta
-arrives `push()` usually returns `[]` and the gate is not consulted at all. The
-tick's own publish is deliberately ungated, which is correct -- that frame
-exists precisely because nothing has painted recently.
+arrives `push()` usually returns `[]` and the gate was not consulted at all. The
+tick's own publish was ungated, on the reasoning that its frame "exists
+precisely because nothing has painted recently."
 
 Measured by driving the real controller with a virtual clock and counting
 whether the gate was consulted even once (it calls `requestFrame` on its first
 invocation, so the count is exact rather than inferred):
 
-| tokens/sec | publishes for 2000 tokens | gate consulted |
-|-----------:|--------------------------:|:---------------|
-|         20 |                      2004 | no             |
-|         60 |                      2004 | no             |
-|        150 |                       670 | no             |
-|        400 |                       289 | no             |
-|       1600 |                        80 | no             |
-|       3200 |                        42 | YES            |
-|       8000 |                        42 | YES            |
+| tokens/sec | publishes for 2000 tokens | gate consulted (before) |
+|-----------:|--------------------------:|:------------------------|
+|         20 |                      2004 | no                      |
+|         60 |                      2004 | no                      |
+|        150 |                       670 | no                      |
+|        400 |                       289 | no                      |
+|       1600 |                        80 | no                      |
+|       3200 |                        42 | YES                     |
+|       8000 |                        42 | YES                     |
 
-The threshold is where 256 bytes land inside a single 16ms window. Real model
-streaming is 20-150 tokens/sec, so the gate is unreachable in practice.
+The threshold was where 256 bytes land inside a single 16ms window. Real model
+streaming is 20-150 tokens/sec, so the gate was unreachable in practice.
 
-This is not currently a defect: paints stay bounded by time (20-38/sec
-observed), which is the property that matters, and the per-publish view work is
-under 9% of a frame even in the worst measured case. It is recorded because
-two things follow from it. There is no backpressure path at all -- the gate is
-the mechanism that notices the renderer cannot keep up, and it never runs. And
-a module with its own tuned constants that never executes will read as load-
-bearing to the next person who changes pacing.
+This was not a live defect: paints stayed bounded by time (20-38/sec observed).
+But two things followed from it. There was no backpressure path at all -- the
+gate is the mechanism that notices the renderer cannot keep up, and it never
+ran. And a module with its own tuned constants that never executes reads as
+load-bearing to the next person who changes pacing.
 
-Fix it by wiring the tick's publish through the gate, or delete the module and
-its constants. Do not leave it looking wired.
+**CLOSED by wiring, not deletion.** The flush tick now publishes THROUGH the
+gate: `if (gate(streamed)) publish()`. The old "ungated is correct here"
+reasoning had the gate's state backwards -- `gate()` returns `true` whenever the
+gate is OPEN, and it is open exactly when nothing has painted recently (it opens
+on its first call and reopens on a frame callback or after `UNPAINTED_REOPEN_MS`
+with no paint). So the tick after a quiet period still paints immediately; the
+gate only skips a tick that fires just after a paint, which is backpressure and
+the one thing this pipeline lacked. `MAX_HELD_CHARS` still forces the tail out,
+so a closed gate cannot swallow the end of an answer, and the final
+`finally`-publish is ungated as before. Both constants are now load-bearing.
 
-Four settings are declared and not yet consumed by anything: `model`,
-`temperature`, `showReasoning` and `showDiagnostics`. That is expected — they
-were written for the settings screen and the engine parameterisation that do
-not exist yet — but it is recorded here so nobody reads the registry and
-concludes they work. `showDiagnostics` is the one to watch: it claims to hide
-dropped events, which are currently rendered unconditionally.
+Pinned by `controller.test.ts` ("the flush tick paints through the publish gate,
+so backpressure bounds it"): 40 ticks with no frame release produce a handful of
+paints, not 40. Reverting to the ungated tick makes every tick paint (measured:
+45 paints for 40 ticks) and fails the bound.
+
+One subtlety the wiring had to answer, or it would have traded a paint-rate
+problem for a visibility one. A tick DRAINS the coalescer before the gate is
+consulted, so a frame the gate rejects is already gone from the coalescer -- its
+text is on the transcript (the run loop applies every event) but not yet
+painted. If the stream then PAUSES, no later tick sees pending text and the gate
+reopening does not itself publish, so that progress would sit invisible until
+the next delta or the final publish -- on a phone, a provider pausing mid-answer
+is ordinary, so this is a real stall, not a corner case. The controller tracks
+how far the screen has actually painted (`paintedChars`) and, on a tick that
+finds nothing new to drain, flushes that stranded progress once the gate has
+reopened. This is the backpressure RELEASE the gate needs to be safe: skip a
+paint under load, then catch up the moment the renderer can. Pinned by
+`controller.test.ts` ("text drained by a rejected tick is still painted when the
+stream pauses"): the reopen fires mid-pause and the full answer paints WHILE THE
+RUN IS STILL LIVE, not only at `end`.
+
+Five settings used to be declared and consumed by nothing: `model`,
+`temperature`, `showReasoning`, `showDiagnostics` and `apiKey` (issue #4636).
+They were written for a settings screen and engine parameterisation that do not
+exist yet. That is not a neutral "not done": a declared-but-unread setting is a
+control the UI promises and the app does not keep, and `showDiagnostics` was
+worse still — its `false` default claimed to hide dropped events, which are
+rendered unconditionally. `apiKey` was the sharp one: `setSecret` was its only
+write path and nothing outside tests called it, and even a written key was never
+sent, because `enginesFor` never passed a `token`.
+
+**Removed rather than half-wired.** `registry.ts` now declares only `engineId`
+and `baseUrl` — the two the shipping app reads — and `registry.test.ts` pins
+`SETTING_DEFS` to `CONSUMED_SETTING_KEYS`, so declaring a setting without also
+wiring the code that reads it fails. The store's secret and validation machinery
+stays (it is contract-tested in `core/src/settings/store.test.ts`), so a real
+setting can return the day its consumer does.
 
 What actually remains for praisonai-mobile, all of it unbuilt rather than
 broken:

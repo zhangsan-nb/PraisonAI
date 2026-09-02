@@ -74,8 +74,23 @@ export interface App {
 }
 
 export type BootResult =
-  | { readonly ok: true; readonly app: App }
-  | { readonly ok: false; readonly reason: string; readonly detail: string };
+  | {
+      readonly ok: true;
+      readonly app: App;
+      /** The app started, but the engine is not answering yet. A caller must
+       *  SAY so -- silently booting into an engine that cannot reply is how a
+       *  first message fails with no explanation. */
+      readonly notReady?: { readonly reason: string; readonly detail: string };
+    }
+  | {
+      readonly ok: false;
+      readonly reason: string;
+      readonly detail: string;
+      /** Set when the failure is a health probe that might succeed on a retry
+       *  -- a still-starting engine, say. A permanent refusal leaves it unset.
+       *  Carried so a caller can poll rather than give up. */
+      readonly retryable?: boolean;
+    };
 
 
 /** A string setting, or the fallback when it is absent or not a string.
@@ -148,7 +163,16 @@ export async function createApp(deps: AppDeps): Promise<BootResult> {
     deps.engines(persistenceFor(session), settings, dropSink.note),
   );
   if (!selection.ok) {
-    return { ok: false, reason: selection.reason, detail: selection.detail };
+    // Includes a health-probe refusal: a remote that answered 200 with
+    // `{"ok": false}`, or that could not be reached at all, is refused HERE
+    // with a name -- not as a transport error mid-answer. `retryable` rides
+    // along so a caller can poll a still-starting engine rather than give up.
+    return {
+      ok: false,
+      reason: selection.reason,
+      detail: selection.detail,
+      ...(selection.retryable === undefined ? {} : { retryable: selection.retryable }),
+    };
   }
   const engine = selection.engine;
 
@@ -192,6 +216,9 @@ export async function createApp(deps: AppDeps): Promise<BootResult> {
 
   return {
     ok: true,
+    // Attached, not swallowed: `selectEngine` hands back an engine that is not
+    // answering yet rather than refusing to boot, and the caller has to say so.
+    ...(selection.notReady === undefined ? {} : { notReady: selection.notReady }),
     app: {
       engine,
       controller,

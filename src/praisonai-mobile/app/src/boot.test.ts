@@ -16,6 +16,8 @@ import { createFakeSecrets } from "../../testing/src/fake-secrets.ts";
 import { createFakeShell } from "../../testing/src/fake-shell.ts";
 import { createScriptedEngine } from "../../testing/src/scripted-engine.ts";
 import { createFakeTime } from "../../testing/src/fake-time.ts";
+import { createFakeHttp, streamOf } from "../../testing/src/fake-http.ts";
+import { probeHealth } from "../../engines/src/remote-http/engine.ts";
 import { SCRIPTS } from "../../testing/src/scripts.ts";
 import { MIN_ENGINE_PROTOCOL, PROTOCOL_VERSION } from "../../protocol/src/version.ts";
 import type { AgentEnginePort } from "../../core/src/ports/agent-engine.ts";
@@ -465,4 +467,180 @@ test("an EMPTY persisted engineId falls back rather than failing the boot", () =
     isSet: () => true,
   } as unknown as Parameters<typeof chosenStringOr>[0];
   assert.equal(chosenStringOr(facade, "engineId", "remote-http"), "remote-http");
+});
+
+// ---- readiness is probed at boot, not discovered mid-turn -------------------
+
+/** A choice whose engine is the scripted happy one, with a health probe that
+ *  returns whatever verdict the test hands it. */
+function probedChoice(id: string, probe: EngineChoice["probe"]): EngineChoice {
+  const engine = engineWith({ id });
+  return { id, create: () => engine, ...(probe === undefined ? {} : { probe }) };
+}
+
+test("an engine answering 200 with ok:false is refused at BOOT, not mid-turn", async () => {
+  // The whole reason readiness.ts exists: the engine reports failure with a 200
+  // and a body of {"ok": false}, so a status code alone is NOT readiness. Until
+  // now nothing ran the probe, so a user pointed at a broken engine got a
+  // transport error part-way through their first answer instead of a named
+  // failure at boot. This drives the REAL probeHealth against a fake transport.
+  const http = createFakeHttp();
+  http.on("/health", () => ({
+    status: 200,
+    headers: {},
+    body: streamOf(JSON.stringify({ ok: false, version: PROTOCOL_VERSION })),
+  }));
+
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [probedChoice("remote", () => probeHealth(http, "http://engine.test"))],
+  }));
+
+  // The probe RUNS -- that is what this file's predecessor was written for, and
+  // it stands. What changed is the verdict: an unhealthy engine may recover, so
+  // it is reported rather than refused. Making it fatal meant a phone with no
+  // desktop engine to reach could not open the app at all, and the user could
+  // not correct the address because Settings is inside the app that would not
+  // start. `main.ts` renders `notReady` as a warning and announces it.
+  assert.equal(result.ok, true, "a recoverable unreadiness must not stop the app");
+  if (!result.ok) return;
+  assert.equal(result.notReady?.reason, "unhealthy", "but the app must be told");
+  assert.match(String(result.notReady?.detail), /false/, "and told what the engine said");
+  await result.app.dispose();
+});
+
+test("a PERMANENT unreadiness is still refused at boot", async () => {
+  // The pair, and the line between the two: a version mismatch does not fix
+  // itself, so booting into it only defers the same failure to the user's
+  // first message. `readiness.ts` marks exactly these `retryable: false`.
+  const http = createFakeHttp();
+  http.on("/health", () => ({
+    status: 200,
+    headers: {},
+    body: streamOf(JSON.stringify({ ok: true, version: 1 })),
+  }));
+
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [probedChoice("remote", () => probeHealth(http, "http://engine.test"))],
+  }));
+
+  assert.equal(result.ok, false, "a too-old engine must refuse to boot");
+  if (result.ok) return;
+  assert.equal(result.reason, "version_mismatch");
+  assert.equal(result.retryable, false, "waiting will not fix a version mismatch");
+});
+
+test("an engine that cannot be reached at all is refused at boot, and retryably", async () => {
+  // The transport case: the remote may simply still be binding its socket. The
+  // 404 the fake returns for an unmatched path is a reach that failed, which
+  // classify() treats as retryable transport.
+  const http = createFakeHttp(); // no /health handler -> 404
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [probedChoice("remote", () => probeHealth(http, "http://engine.test"))],
+  }));
+
+  // Retryable, so the app STARTS and reports it. This is the case that made
+  // the hard gate untenable: on a phone there is usually no desktop engine to
+  // reach, so refusing here meant the app never opened.
+  assert.equal(result.ok, true, "an unreachable engine must not stop the app");
+  if (!result.ok) return;
+  assert.equal(result.notReady?.reason, "http_status");
+  await result.app.dispose();
+});
+
+test("a healthy probe lets the boot through -- the pair", async () => {
+  // Without this a probe that refused everything would satisfy the cases above
+  // and no engine could ever boot.
+  const http = createFakeHttp();
+  http.on("/health", () => ({
+    status: 200,
+    headers: {},
+    body: streamOf(JSON.stringify({ ok: true, version: PROTOCOL_VERSION })),
+  }));
+
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [probedChoice("remote", () => probeHealth(http, "http://engine.test"))],
+  }));
+
+  assert.equal(result.ok, true, "a healthy engine must boot");
+  if (result.ok) await result.app.dispose();
+});
+
+test("an engine with no probe boots unchanged -- probing is optional", async () => {
+  // The in-process engine has no remote to probe. A choice that supplies no
+  // probe must not be blocked; only the presence of a probe adds the check.
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [probedChoice("remote", undefined)],
+  }));
+  assert.equal(result.ok, true);
+  if (result.ok) await result.app.dispose();
+});
+
+test("an engine PERMANENTLY rejected by its probe is disposed, not left holding a socket", async () => {
+  // Same guarantee a protocol mismatch already has: a refused engine that keeps
+  // its socket is a leak that only surfaces as a second, unrelated failure.
+  let disposed = false;
+  const inner = createScriptedEngine({ script: SCRIPTS.happy });
+  const engine: AgentEnginePort = {
+    ...inner,
+    id: "remote",
+    dispose: async () => void (disposed = true),
+  };
+  await createApp(deps({
+    engineId: "remote",
+    engines: () => [
+      { id: "remote", create: () => engine, probe: async () => ({ ready: false, reason: "version_mismatch", detail: "too old", retryable: false }) },
+    ],
+  }));
+  assert.equal(disposed, true);
+});
+
+test("an engine kept despite a RETRYABLE rejection is NOT disposed", async () => {
+  // The pair, and the reason the two cases differ: a retryable unreadiness
+  // hands the engine over so the app can use it once the remote comes up.
+  // Disposing it here would leave the app holding a dead engine it can never
+  // retry through.
+  let disposed = false;
+  const inner = createScriptedEngine({ script: SCRIPTS.happy });
+  const engine: AgentEnginePort = {
+    ...inner,
+    id: "remote",
+    dispose: async () => void (disposed = true),
+  };
+  const result = await createApp(deps({
+    engineId: "remote",
+    engines: () => [
+      { id: "remote", create: () => engine, probe: async () => ({ ready: false, reason: "unhealthy", detail: "false", retryable: true }) },
+    ],
+  }));
+  assert.equal(disposed, false, "the engine is still the one the app will use");
+  assert.equal(result.ok, true);
+  if (result.ok) await result.app.dispose();
+  assert.equal(disposed, true, "and it is disposed when the app is");
+});
+
+test("selectEngine runs the probe only after the protocol check passes", async () => {
+  // The probe opens a socket to the remote. Running it before the cheap,
+  // I/O-free protocol check would reach the network for an engine this build
+  // can never speak to anyway.
+  const order: string[] = [];
+  const engine = engineWith({ id: "remote", protocolVersion: MIN_ENGINE_PROTOCOL - 1 });
+  const outcome = await selectEngine("remote", [
+    {
+      id: "remote",
+      create: () => engine,
+      probe: async () => {
+        order.push("probe");
+        return { ready: true, protocol: PROTOCOL_VERSION, degraded: [] };
+      },
+    },
+  ]);
+  assert.equal(outcome.ok, false);
+  if (outcome.ok) return;
+  assert.equal(outcome.reason, "protocol_mismatch", "the protocol mismatch wins");
+  assert.deepEqual(order, [], "the probe must not run for an engine we cannot speak to");
 });
