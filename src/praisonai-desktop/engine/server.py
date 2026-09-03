@@ -361,6 +361,59 @@ def list_chats() -> list:
                         "count": 0, "corrupt": True})
     return sorted(out, key=lambda c: c["updated"], reverse=True)
 
+
+def _search_chats(query: str) -> list:
+    """Ranked full-text search over stored chats.
+
+    Delegates to the library's ``SqliteSessionStore`` (FTS5/bm25 with snippets
+    and lineage dedup) over the on-disk chat transcripts instead of loading
+    every chat JSON and doing a substring ``in`` scan. The chats already live
+    on disk as ``<id>.json`` with a ``messages`` list, which the store indexes
+    directly. Falls back to the substring scan if the store is unavailable so
+    search never breaks.
+    """
+    try:
+        from praisonaiagents.session import SqliteSessionStore
+
+        class _ChatSessionStore(SqliteSessionStore):
+            # Desktop chats persist their identity under ``id`` (see save_chat),
+            # not the ``session_id`` the session schema expects, so a loaded
+            # chat's ``session_id`` is empty and every chat would collide on the
+            # same empty index key. Backfill it from the filename-derived id so
+            # each chat is indexed and addressable independently.
+            def _read_session_fresh(self, session_id):
+                session = super()._read_session_fresh(session_id)
+                if not getattr(session, "session_id", ""):
+                    session.session_id = session_id
+                return session
+
+        # An in-memory index is rebuilt from the current on-disk transcripts on
+        # each query, so an edited chat is never served stale — a persistent
+        # index would skip re-indexing chats whose id is already present.
+        store = _ChatSessionStore(session_dir=str(CHATS_DIR), db_path=":memory:")
+        hits = store.search(query, limit=20)
+        titles = {c["id"]: c["title"] for c in list_chats()}
+        return [
+            {
+                "id": h.session_id,
+                "title": titles.get(h.session_id, h.title or "New chat"),
+                "snippet": h.snippet,
+            }
+            for h in hits
+        ]
+    except Exception:
+        needle = query.lower()
+        hits = []
+        for meta in list_chats():
+            chat = load_chat(meta["id"])
+            for m in chat.get("messages", []):
+                if needle in str(m.get("content", "")).lower():
+                    hits.append({"id": meta["id"], "title": meta["title"],
+                                 "snippet": str(m.get("content"))[:120]})
+                    break
+        return hits
+
+
 _agent_lock = threading.Lock()
 _agents = {}
 
@@ -518,10 +571,17 @@ def _builtin_tools():
     user cannot refuse is the wrong order to build in.
     """
 
+    # Risk class per tool. "smart" mode waves through low-risk reads and only
+    # prompts for medium-or-higher; anything unlisted is treated as high so a
+    # new tool is guarded by default rather than silently trusted.
+    _low_risk = {"read_file", "list_directory", "current_time", "web_search"}
+
     def _gate(name, args):
         """Ask the user before a filesystem read. Returns True when allowed."""
         mode = load_settings().get("approval_mode", "ask")
         if mode == "never" or name in _always_allow:
+            return True
+        if mode == "smart" and name in _low_risk:
             return True
         if getattr(_tool_events, "emit", None) is None:
             # No stream to ask on. Blocking here would hang the turn for the
@@ -706,6 +766,7 @@ DEFAULT_SETTINGS = {
     "temperature": 0.7,
     "max_tokens": 0,
     "top_p": 1,
+    "reasoning_effort": "off",
     "base_url": "",
     "api_key": "",
     "system_prompt": "",
@@ -1093,6 +1154,11 @@ def _llm_overrides(cfg: dict) -> dict:
         out["max_tokens"] = int(cfg["max_tokens"])
     if cfg.get("top_p") != DEFAULT_SETTINGS["top_p"]:
         out["top_p"] = float(cfg["top_p"])
+    # "off" is the default no-op; anything else is a provider-portable effort
+    # level (minimal|low|medium|high) that Agent maps to each backend's native
+    # knob, exactly as the CLI's --thinking does.
+    if cfg.get("reasoning_effort") not in (None, "", DEFAULT_SETTINGS["reasoning_effort"]):
+        out["reasoning_effort"] = str(cfg["reasoning_effort"])
     _apply_env(cfg)
     return out
 
@@ -1119,6 +1185,54 @@ def _apply_env(cfg: dict) -> None:
         _export("OPENAI_API_KEY", key)
     elif not key:
         _unset_if_ours("OPENAI_API_KEY")
+
+
+def model_needs_litellm(model: str) -> bool:
+    """Whether this model id would take praisonaiagents' custom-LLM path.
+
+    A string model id containing a slash routes through LiteLLM in
+    praisonaiagents (agent.py: `elif isinstance(llm, str) and "/" in llm`).
+    Bare names go to the plain-OpenAI client instead. The desktop provisions
+    only the base package, which does not depend on litellm, so a slashed id
+    imports nothing and fails on the first turn -- this predicts that before it
+    is saved.
+    """
+    return isinstance(model, str) and "/" in model
+
+
+def litellm_available() -> bool:
+    """Whether the custom-LLM (litellm) path can actually run in this venv.
+
+    The lean desktop venv installs praisonaiagents without its `llm` extra, so
+    litellm is usually absent. Checked by import spec rather than importing, so
+    this stays cheap and has no side effects.
+    """
+    try:
+        import importlib.util
+        return importlib.util.find_spec("litellm") is not None
+    except Exception:  # noqa: BLE001 - a broken meta-path finder is "not available"
+        return False
+
+
+def unsupported_model_reason(model: str) -> "str | None":
+    """Why this model id cannot run in this build, or None if it can.
+
+    The message names the constraint the user can act on -- a slashed id needs
+    the LiteLLM path, which this lean build does not ship -- rather than letting
+    the turn fail later with an import error or a bare-OpenAI 404.
+    """
+    if model_needs_litellm(model) and not litellm_available():
+        # Name only a remedy that actually clears the guard. The check keys on
+        # the slash alone, so a Base URL override does NOT help -- a slashed id
+        # still routes through LiteLLM. The fix is a bare id: a plain
+        # OpenAI-compatible name (optionally paired with a Base URL) reaches any
+        # OpenAI-style endpoint without the missing provider path.
+        return (f"The model id \u201c{model}\u201d needs the LiteLLM provider path, "
+                "which this build does not include. Use a plain OpenAI-compatible "
+                "model id without a provider prefix (for example gpt-4o-mini); to "
+                "reach another endpoint, keep the bare id and set a Base URL "
+                "override.")
+    return None
 
 
 def _installed_version() -> str:
@@ -1424,6 +1538,42 @@ def redacted(cfg: dict) -> dict:
     return out
 
 
+# --- request origin -----------------------------------------------------------
+# The engine binds loopback, which keeps other machines out but NOT other pages:
+# any site open in the user's browser can reach 127.0.0.1 with a two-line fetch.
+# With `Access-Control-Allow-Origin: *` and no auth, that page could POST
+# /settings and repoint `base_url` at a host it controls -- the stored API key
+# then travels to that host on the next turn. Redacting replies (see redacted())
+# stopped the key being echoed; it did nothing about the key being *sent*.
+#
+# A browser attaches Origin to every cross-origin request and a page cannot forge
+# it, so refusing unknown origins closes that path without a shared secret (which
+# would need the Rust shell to carry one). Requests with NO Origin are allowed:
+# that is cli.py, the tests and curl -- local processes that already have the
+# user's filesystem, so a token would protect nothing.
+ALLOWED_ORIGIN_HOSTS = {"tauri.localhost", "localhost", "127.0.0.1", "[::1]", "::1"}
+
+
+def origin_allowed(origin: str) -> bool:
+    """Whether a browser Origin may talk to the engine.
+
+    Accepts the webview's own origin on every platform Tauri targets --
+    `tauri://localhost` on macOS and Linux, `http://tauri.localhost` on Windows
+    and Android -- plus localhost on any port for `npm run dev`.
+    """
+    if not origin:
+        return True                      # not a browser; see the note above
+    if origin == "null":
+        return False                     # sandboxed iframe / file:// document
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("tauri", "http", "https"):
+        return False
+    return (parsed.hostname or "") in ALLOWED_ORIGIN_HOSTS
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1431,10 +1581,37 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # Echo the caller's own origin rather than "*", so only the origins
+        # origin_allowed() admits can read a reply.
+        origin = self.headers.get("Origin") or ""
+        if origin and origin_allowed(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Headers", "content-type")
 
+    def _origin_ok(self) -> bool:
+        """Refuse a browser origin the engine does not recognise.
+
+        Answers the request with 403 and no CORS headers, so the calling page
+        cannot read the reply either.
+        """
+        if origin_allowed(self.headers.get("Origin") or ""):
+            return True
+        self._drain()
+        body = b'{"error":"origin not allowed"}'
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        return False
+
     def do_OPTIONS(self):
+        if not self._origin_ok():
+            return
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
@@ -1541,6 +1718,8 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.25)
 
     def do_GET(self):
+        if not self._origin_ok():
+            return
         if self.path.startswith("/train/progress"):
             trainer = self._training()
             from urllib.parse import parse_qs, urlparse
@@ -1608,17 +1787,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/search?"):
             from urllib.parse import parse_qs, urlparse
-            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0].lower().strip()
-            hits = []
-            if q:
-                for meta in list_chats():
-                    chat = load_chat(meta["id"])
-                    for m in chat.get("messages", []):
-                        if q in str(m.get("content", "")).lower():
-                            hits.append({"id": meta["id"], "title": meta["title"],
-                                         "snippet": str(m.get("content"))[:120]})
-                            break
-            self._json({"hits": hits})
+            q = (parse_qs(urlparse(self.path).query).get("q") or [""])[0].strip()
+            self._json({"hits": _search_chats(q) if q else []})
             return
         if self.path == "/chats":
             self._json({"chats": list_chats()})
@@ -1654,6 +1824,10 @@ class Handler(BaseHTTPRequestHandler):
                            "shell_version": os.environ.get(
                                "PRAISONAI_DESKTOP_VERSION", "unknown"),
                            "agents_version": _installed_version(),
+                           # Whether the LiteLLM provider path is importable, so
+                           # the picker can mark slashed provider ids this build
+                           # cannot run rather than offering them silently.
+                           "litellm": litellm_available(),
                            "data_dir": str(DATA_DIR)}).encode()
         self.send_response(200)
         self._cors()
@@ -1663,6 +1837,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_DELETE(self):
+        if not self._origin_ok():
+            return
         if not self.path.startswith("/chats/"):
             self.send_error(404)
             return
@@ -1679,6 +1855,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def do_POST(self):
+        if not self._origin_ok():
+            return
         if self.path == "/train/start":
             payload = self._body()
             config = payload.get("config") or {}
@@ -1761,6 +1939,14 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 self.send_error(400)
                 return
+            # Reject a model this build cannot run before it is saved, so the
+            # failure lands here with an explanation rather than on the first
+            # turn as an import error or a bare-OpenAI 404.
+            if "model" in patch:
+                reason = unsupported_model_reason(patch["model"])
+                if reason is not None:
+                    self._json({"ok": False, "error": reason}, 422)
+                    return
             if "launch_at_login" in patch:
                 # Persist what actually happened, not what was asked. Writing
                 # the request first made the toggle report a login item that
@@ -1938,8 +2124,16 @@ class Handler(BaseHTTPRequestHandler):
             chat_id = payload.get("chat_id") or session
             regenerate_of = payload.get("regenerate_of")
             tools_on = payload.get("tools", True) is not False
+            # Images arrive as data: URIs and go to the agent as attachments= so a
+            # vision model actually sees them; text-like files keep being folded
+            # into the prompt as before. Nothing binary is ever stringified.
+            media_attachments = []
             for att in (payload.get("attachments") or [])[:5]:
                 nm = str(att.get("name", "file"))[:120]
+                url = att.get("url")
+                if isinstance(url, str) and url.startswith("data:"):
+                    media_attachments.append(url)
+                    continue
                 body = str(att.get("text", ""))[:100_000]
                 prompt = f"{prompt}\n\n--- attached: {nm} ---\n{body}"
         except (ValueError, TypeError):
@@ -2030,8 +2224,10 @@ class Handler(BaseHTTPRequestHandler):
                                          "seconds": ev["seconds"]})
                 return shown
 
-            for chunk in agent.start(turn_prompt, stream=True,
-                                     **_llm_overrides(load_settings())):
+            start_kwargs = dict(_llm_overrides(load_settings()))
+            if media_attachments:
+                start_kwargs["attachments"] = media_attachments
+            for chunk in agent.start(turn_prompt, stream=True, **start_kwargs):
                 # Counted here too. This call drains the queue, so discarding
                 # its result meant the tally further down always read zero
                 # unless the loop body never ran at all -- and the tests only

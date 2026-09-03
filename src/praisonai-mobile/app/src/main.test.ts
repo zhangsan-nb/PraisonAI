@@ -7,24 +7,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { defaultEngineIdFor, stopNotice } from "./main.ts";
+import { stopNotice } from "./main.ts";
+import { defaultEngineIdFor } from "./registry.ts";
 import { en } from "../../ui/src/i18n/strings.ts";
 
-test("every platform's first-launch default is the remote engine, for now", () => {
-  // Tempting to default a device to the in-process engine -- a phone cannot
-  // reach `http://127.0.0.1:8765` and the cleartext localhost address is
-  // refused by iOS ATS and Android -- but the in-process engine's module is
-  // ABSENT from the shipping webview: build-webview.mjs bundles only
-  // `main.ts` into `dist/app.js`, and the engine reaches praisonai-ts through a
-  // runtime-computed import left outside that bundle (#4437). So defaulting a
-  // device to it would swap the "not answering" warning (which names Settings
-  // as the fix) for a first prompt that fails "unavailable in this build" with
-  // no recovery -- the very brick registry.ts keeps the engine out of the
-  // picker to avoid. Until #4437 ships praisonai-ts inside the webview, remote
-  // is the honest default. `Platform["kind"]` also cannot tell desktop Tauri
-  // (`cargo tauri dev`) from a phone, so a `kind === "tauri"` default would
-  // strand the desktop/dev flow too.
-  assert.equal(defaultEngineIdFor("tauri"), ENGINE_REMOTE_HTTP);
+test("a device's first-launch default is the in-process engine; the web's is remote", () => {
+  // A phone cannot reach `http://127.0.0.1:8765`, and the cleartext localhost
+  // address is refused by iOS ATS and Android -- so a remote default on a
+  // device was a first prompt that failed with a status code. The in-process
+  // engine ships as a lazy chunk beside app.js now, so it is the one choice
+  // that works with nothing configured, and the picker offers it. The web
+  // keeps the remote engine: a server is what a browser tab has.
+  // `Platform["kind"]` cannot tell desktop Tauri (`cargo tauri dev`) from a
+  // phone, so desktop starts in-process too and switches in Settings.
+  assert.equal(defaultEngineIdFor("tauri"), ENGINE_PRAISONAI_TS);
   assert.equal(defaultEngineIdFor("web"), ENGINE_REMOTE_HTTP);
 });
 
@@ -81,11 +77,14 @@ test("the real composition root offers the in-process engine", async () => {
       return { userIndex: 0, assistantIndex: 1, versions: 1, active: 0 };
     },
   };
+  const conversation = { messages: () => [] };
 
   const ids = appEngines({
     settings,
     http: createFakeHttp(),
+    secrets,
     persistence,
+    history: conversation,
     onIgnored: () => {},
   }).map((c) => c.id);
 
@@ -95,15 +94,17 @@ test("the real composition root offers the in-process engine", async () => {
   assert.equal(ids[0], ENGINE_REMOTE_HTTP, "the remote engine must stay the default");
 });
 
-test("the in-process engine, when its module cannot load, fails RECOVERABLY", async () => {
-  // The factory's dynamic import resolves at run time from a computed
-  // specifier, and where praisonai-ts is not on disk -- the shipping webview
-  // bundles only dist/ (#4437), and this test runs with the same absence -- it
-  // rejects. Constructing the engine must still succeed (create() opens no
-  // upstream), and the failure must arrive as a single recoverable `error`
-  // event through engine.ts's run loop, never as an unhandled rejection that
-  // takes down the turn opaquely. That is the named, on-screen failure
-  // engines.ts argues for.
+test("the in-process engine, when its chunk cannot load, fails RECOVERABLY", async () => {
+  // The engine reaches praisonai through a lazily-fetched chunk, and a fetch
+  // can fail: a flaky connection, a build that left the engine out, a hashed
+  // file the page no longer matches. This used to be exercised by the module's
+  // ABSENCE from disk; with praisonai installed the real loader succeeds here
+  // (and would go to the network), so the failing loader is INJECTED, through
+  // the seam appEngines exposes for exactly this. Constructing the engine must
+  // still succeed (create() opens no upstream), and the failure must arrive as
+  // a single recoverable `error` event through engine.ts's run loop, never as
+  // an unhandled rejection that takes down the turn opaquely. That is the
+  // named, on-screen failure engines.ts argues for.
   const secrets = createFakeSecrets();
   const store = createSettingsStore(SETTING_DEFS, createFakeStorage(), secrets);
   await store.load();
@@ -113,12 +114,18 @@ test("the in-process engine, when its module cannot load, fails RECOVERABLY", as
       return { userIndex: 0, assistantIndex: 1, versions: 1, active: 0 };
     },
   };
+  const conversation = { messages: () => [] };
 
   const inProcess = appEngines({
     settings,
     http: createFakeHttp(),
+    secrets,
     persistence,
+    history: conversation,
     onIgnored: () => {},
+    loadAgent: async () => {
+      throw new Error("chunk-XXXXXXXX.js: failed to fetch");
+    },
   }).find((c) => c.id === ENGINE_PRAISONAI_TS);
   assert.ok(inProcess, "the in-process engine must be on offer to be exercised");
 
@@ -173,16 +180,29 @@ function harness(over: { storage?: ReturnType<typeof createFakeStorage> } = {}) 
   const dom = createFakeDom();
   const http = createFakeHttp();
   const storage = over.storage ?? createFakeStorage();
+  // Returned as well as installed: the secret tests below have to look INSIDE
+  // the keychain to prove a pasted key landed there, and `reads` is what proves
+  // the settings screen asked for presence rather than for the value.
+  const secrets = createFakeSecrets();
   const platform: Platform = {
     shell: createFakeShell(PHONE_INSETS),
     storage,
-    secrets: createFakeSecrets(),
+    secrets,
     http,
     time: nodeTime(),
     kind: "web",
   };
-  return { dom, http, storage, platform };
+  return { dom, http, storage, secrets, platform };
 }
+
+/** The API key field on the settings screen, by its accessible name. */
+const keyField = (dom: ReturnType<typeof createFakeDom>) =>
+  dom.find((n) => n.tagName === "INPUT" && n.getAttribute("aria-label") === "OpenAI API key");
+
+/** The presence word for a secret row ("Configured" / "Not set" / UNKNOWN). */
+const presenceOf = (dom: ReturnType<typeof createFakeDom>, key: string) =>
+  dom.find((n) => n.dataset["secretPresence"] === key)?.textContent ?? null;
+
 
 const submit = (dom: ReturnType<typeof createFakeDom>, text: string): void => {
   const box = dom.find((n) => n.tagName === "TEXTAREA");
@@ -431,12 +451,19 @@ test("the keyboard height and BOTH insets reach the layout", async () => {
   assert.ok(screen, "no screen element");
   const props = (screen as unknown as { style: { props: Record<string, string> } }).style.props;
   assert.equal(props["--keyboard-height"], "300px", "the keyboard height must reach the layout");
-  assert.equal(props["--inset-top"], `${PHONE_INSETS.top}px`, "the TOP inset must come from the top");
+  // The four insets go on ROOT, not on the chat screen: settings and chats are
+  // siblings of it, so an inset written on `screen` never reaches them -- which
+  // is what left their headings under the status bar.
+  const rootProps = (dom.root as unknown as { style: { props: Record<string, string> } }).style.props;
+  assert.equal(rootProps["--inset-top"], `${PHONE_INSETS.top}px`, "the TOP inset must come from the top");
   assert.notEqual(
-    props["--inset-top"],
+    rootProps["--inset-top"],
     `${PHONE_INSETS.bottom}px`,
     "reading the top inset from the bottom puts content under the notch",
   );
+  assert.equal(rootProps["--inset-bottom"], `${PHONE_INSETS.bottom}px`, "and the bottom from the bottom");
+  assert.equal(rootProps["--inset-left"], `${PHONE_INSETS.left}px`);
+  assert.equal(rootProps["--inset-right"], `${PHONE_INSETS.right}px`);
   app?.dispose();
 });
 
@@ -451,13 +478,12 @@ test("the layout keeps reacting after mount, not only on the first frame", async
     http: createFakeHttp(), time: nodeTime(), kind: "web",
   };
   const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
-  const screen = dom.find((n) => n.className === "screen");
-  assert.ok(screen, "no screen element");
-  const props = (screen as unknown as { style: { props: Record<string, string> } }).style.props;
+  const props = (dom.root as unknown as { style: { props: Record<string, string> } }).style.props;
 
   shell.setInsets({ top: 99, bottom: 12, left: 3, right: 4 });
   await settle(20);
   assert.equal(props["--inset-top"], "99px", "a rotation must reach the layout");
+  assert.equal(props["--inset-bottom"], "12px", "and every other edge with it");
   app?.dispose();
 });
 
@@ -1278,4 +1304,741 @@ test("an ACCEPTED setting clears its OWN refusal, and only its own", async () =>
     `an accepted write must leave no refusal on its own field:\n${dom.text()}`,
   );
   app?.dispose();
+});
+
+test("on a device with nothing configured, the first message reaches the in-process Agent", async () => {
+  // The whole wiring, end to end, from the real composition root: platform
+  // kind "tauri", empty storage, no engine picked -- so `defaultEngineIdFor`
+  // decides -- and a message typed into the real composer. It must arrive at
+  // praisonai's `Agent`, and the answer must come back through the real
+  // engine, controller and transcript onto the screen. No network and no
+  // key: the Agent class is a scripted one handed in through the seam
+  // `appEngines` exposes for it, the way praisonai-ts's own engine tests
+  // script theirs. Every other piece is the shipping one.
+  const prompts: string[] = [];
+  const configs: { instructions: string; llm?: string }[] = [];
+  class ScriptedAgent {
+    lastStopReason: "completed" | null = "completed";
+    constructor(config: { instructions: string; llm?: string }) {
+      configs.push(config);
+    }
+    setHistory() {}
+    async *streamEvents(prompt: string) {
+      prompts.push(prompt);
+      yield { type: "text", delta: "The capital of France is Paris." } as const;
+      yield { type: "finish", text: "The capital of France is Paris." } as const;
+    }
+  }
+
+  const { dom, http, platform: web } = harness();
+  http.on("/chat", () => {
+    throw new Error("the remote engine must not be contacted on a device");
+  });
+  const platform: Platform = { ...web, kind: "tauri" };
+  const app = await mount({
+    root: dom.root as never,
+    platform,
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => ScriptedAgent,
+  });
+  assert.ok(app, "the app must mount");
+  assert.equal(app.engine.id, ENGINE_PRAISONAI_TS, "with nothing configured, a device runs in-process");
+  assert.equal(
+    app.settings.get("engineId"),
+    ENGINE_PRAISONAI_TS,
+    "and Settings shows the same engine -- main.ts must hand boot the platform's defs, not the web's",
+  );
+
+  submit(dom, "capital of france?");
+  await settle(120);
+
+  assert.deepEqual(prompts, ["capital of france?"], "the typed message must reach the Agent verbatim");
+  assert.equal(configs.length, 1, "one Agent, built on the first turn -- not at boot");
+  assert.equal(configs[0]?.llm, "gpt-4o-mini", "with the model the settings default to");
+  const answer = dom.find((n) => n.textContent.includes("Paris") && n.className.includes("row"));
+  assert.ok(answer, "the Agent's answer must reach the transcript");
+  assert.equal(dom.find((n) => n.className.includes("row-error")), null, "and nothing must fail on the way");
+  await app.dispose();
+});
+
+// ---- deleting a conversation ------------------------------------------------
+//
+// `session.remove` -> `repository.remove` -> `storage.remove` were implemented,
+// unit-tested and contract-tested; `intents.ts` decoded a `delete-chat` intent
+// and had a test for it. Nothing in the app rendered a control carrying that
+// intent and `perform` had no case for it, so a conversation, once started,
+// could not be removed from the device by any sequence of taps. Storage grew
+// forever and anything typed into a chat stayed there.
+
+test("a conversation can be DELETED from the chat list", async () => {
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  assert.notEqual(app, null);
+  await app!.session.record("what is the capital of France", "Paris");
+  assert.equal((await app!.session.list()).length, 1, "precondition: one stored chat");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  const del = dom.find((n) => n.dataset["action"] === "delete-chat");
+  assert.ok(del, `no delete control on a chat row:\n${dom.text()}`);
+  // Two taps: the first arms, the second deletes.
+  dom.click(del as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+
+  assert.deepEqual(await app!.session.list(), [], "the conversation is still on disk");
+  app?.dispose();
+});
+
+test("the FIRST tap on Delete does not delete", async () => {
+  // The pair. A single-tap irreversible delete a few millimetres from the row
+  // that opens the chat is a conversation lost to a mis-tap, and there is no
+  // undo anywhere in this app.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await app!.session.record("keep me", "sure");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+
+  assert.equal((await app!.session.list()).length, 1, "one tap must not delete");
+  // And the control says so rather than looking unchanged.
+  const del = dom.find((n) => n.dataset["action"] === "delete-chat");
+  assert.equal(del?.dataset["armed"], "true", "the armed state must be visible");
+  assert.equal(del?.textContent, en.actionConfirmDelete);
+  app?.dispose();
+});
+
+test("deleting the chat that is OPEN clears it off the screen", async () => {
+  // Otherwise the user is left typing into a transcript that no longer exists
+  // on disk, and the next turn silently re-creates it.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await app!.session.record("what is the capital of France", "Paris");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "open-chat") as never);
+  await settle();
+  assert.match(dom.text(), /Paris/, "precondition: the chat is open");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+
+  const transcript = dom.find((n) => n.className.includes("transcript"));
+  assert.doesNotMatch(
+    transcript?.textContent ?? "",
+    /Paris/,
+    "the deleted conversation is still painted",
+  );
+  app?.dispose();
+});
+
+test("a delete that STORAGE refuses is said, not swallowed", async () => {
+  // `storage.remove` rejects on a real device -- SecurityError with site data
+  // blocked. A delete that quietly did nothing leaves the user believing a
+  // conversation is gone when it is still there.
+  const storage = createFakeStorage();
+  const { dom, platform } = harness({ storage });
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await app!.session.record("keep me", "sure");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  const remove = storage.remove.bind(storage);
+  (storage as { remove: (k: unknown) => Promise<void> }).remove = async () => {
+    throw new Error("SecurityError");
+  };
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+  (storage as { remove: (k: unknown) => Promise<void> }).remove = remove as never;
+
+  const assertive = dom.find((n) => n.getAttribute("aria-live") === "assertive");
+  assert.match(assertive?.textContent ?? "", /could not be deleted/i, `said nothing:\n${dom.text()}`);
+  assert.equal((await app!.session.list()).length, 1, "and nothing was actually removed");
+  app?.dispose();
+});
+
+test("a delete label names ONLY the chat, not its time and button text", async () => {
+  // `syncDeleteArming` re-derived the title from `parentElement.textContent`,
+  // which folds in the chat title, the relative time and the button's own word
+  // -- so arming turned "Delete Trip to Kyoto" into "Delete Trip to Kyoto3h
+  // agoConfirm". The clean title is carried on the button's dataset instead.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await app!.session.record("what is the capital of France", "Paris");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  const del = dom.find((n) => n.dataset["action"] === "delete-chat");
+  assert.ok(del, `no delete control on a chat row:\n${dom.text()}`);
+  // The clean title -- exactly what `deleteChat(title)` names before arming.
+  const title = (del.getAttribute("aria-label") ?? "").replace(/^Delete /, "");
+  assert.equal(del.getAttribute("aria-label"), en.deleteChat(title), "the resting label is not the clean title");
+  dom.click(del as never); // arm
+  await settle();
+
+  const armed = dom.find((n) => n.dataset["action"] === "delete-chat");
+  const label = armed?.getAttribute("aria-label") ?? "";
+  // The armed label is the confirm string built from the SAME clean title --
+  // not the row's whole text (title + relative time + the button's own word),
+  // which is what `parentElement.textContent` used to fold in.
+  assert.equal(label, en.deleteChatConfirm(title), `the armed label was not the clean confirm string:\n${label}`);
+  assert.doesNotMatch(label, /ago/, `the armed label folded in the row's time:\n${label}`);
+  app?.dispose();
+});
+
+test("a delete when the chat list read REJECTS stays LOCAL, not fatal", async () => {
+  // The title shown in the confirmation is looked up via `session.list()`,
+  // which reads StoragePort and REJECTS on a real device. That read sits
+  // outside the remove try and `perform` is invoked through a floating `void`,
+  // so a rejection there reached the global crash handler and replaced the
+  // WHOLE app with the fatal screen -- for a lookup that only decides a label.
+  const storage = createFakeStorage();
+  const { dom, platform } = harness({ storage });
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await app!.session.record("keep me", "sure");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  storage.failNext("SecurityError: site data blocked");
+  dom.click(dom.find((n) => n.dataset["action"] === "delete-chat") as never);
+  await settle();
+
+  assert.equal(
+    /could not start/.test(dom.text()),
+    false,
+    "a failed chat-list read must not become the app-wide crash screen",
+  );
+  assert.equal((await app!.session.list()).length, 1, "and nothing was removed");
+  app?.dispose();
+});
+
+test("a chat row SHOWS when it was last used", async () => {
+  // `buildChatList` has computed `updatedLabel` for every row since it was
+  // written and the renderer dropped it on the floor, so a list SORTED by
+  // recency displayed none of it -- and two chats both called "Untitled" were
+  // indistinguishable. The label reaches the row's visible text AND its
+  // accessible name, from one string, so the two cannot drift.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1_000_000, newChatId: () => "c1" });
+  await app!.session.record("what is the capital of France", "Paris");
+
+  dom.click(dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+
+  const open = dom.find((n) => n.dataset["action"] === "open-chat");
+  assert.ok(open, "no chat row");
+  assert.match(open.textContent, /just now/, `no relative time on the row:\n${dom.text()}`);
+  assert.match(
+    open.getAttribute("aria-label") ?? "",
+    /just now/,
+    "the spoken name must carry the same time the row shows",
+  );
+  app?.dispose();
+});
+
+test("the WALL CLOCK is read through TimePort.epochMs, not Date.now", async () => {
+  // `TimePort.epochMs` was implemented and conformance-tested and had zero
+  // callers in the whole application: every wall-clock read in main.ts was a
+  // bare `Date.now()`, so the seam that makes time injectable ran past its own
+  // port. `now` is deliberately NOT passed here, which is the production path.
+  const { dom, platform } = harness();
+  const FIXED = 1_700_000_000_000;
+  const timed: Platform = { ...platform, time: { ...platform.time, epochMs: () => FIXED } };
+  const app = await mount({ root: dom.root as never, platform: timed, newChatId: () => "c1" });
+  await app!.session.record("hello", "hi");
+  const [chat] = await app!.session.list();
+  assert.equal(chat?.updated, FIXED, "the chat's timestamp did not come from the port");
+  app?.dispose();
+});
+
+test("streaming announcements are paced by the MONOTONIC clock, not the wall clock", async () => {
+  // `announce` rate-limits with `nowMs - lastStreamAtMs >= ANNOUNCE_INTERVAL_MS`
+  // -- an ELAPSED comparison, which `core/src/ports/time.ts` says in as many
+  // words must use `nowMs` and never the wall clock: "Conflating them is how a
+  // clock correction mid-stream makes a coalescer wait forever". main.ts passed
+  // `Date.now()`, so an NTP correction moving the clock backwards mid-answer
+  // silences every further streaming announcement until real time catches up
+  // with the pre-correction reading, and a screen-reader user simply stops
+  // being told what the model is saying.
+  //
+  // Driven here by a monotonic clock that advances a second per read against a
+  // turn that never ends: with the port's clock BOTH finished sentences are
+  // spoken during the stream, and with `Date.now()` the second one waits for a
+  // terminal event that is not coming.
+  const { dom, http, platform } = harness();
+  let tick = 0;
+  const timed: Platform = {
+    ...platform,
+    time: { ...platform.time, nowMs: () => (tick += 1000) },
+  };
+  http.on("/chat", () => ({
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+    body: new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const enc = new TextEncoder();
+        controller.enqueue(enc.encode(sse([["start", { msg_id: "m1", run_id: "r1" }]])));
+        controller.enqueue(enc.encode(sse([["delta", { msg_id: "m1", text: "The first sentence. " }]])));
+        await new Promise((r) => setTimeout(r, 40));
+        controller.enqueue(enc.encode(sse([["delta", { msg_id: "m1", text: "The second sentence. " }]])));
+        // Never closed: an `end` would flush everything held back regardless
+        // of which clock paced it, and the test would pass against the defect.
+      },
+    }),
+  }));
+  const app = await mount({ root: dom.root as never, platform: timed, now: () => 1, newChatId: () => "c1" });
+  submit(dom, "two sentences please");
+  await settle(200);
+
+  // The region is REASSIGNED per publish (each utterance replaces the last),
+  // so what it holds at the end is the most recent thing said. With the port's
+  // clock that is the second sentence; rate-limited by the wall clock, the
+  // second announcement never happens and the region still reads the first.
+  const polite = dom.find((n) => n.getAttribute("aria-live") === "polite");
+  assert.match(
+    polite?.textContent ?? "",
+    /second sentence/i,
+    `the second sentence never reached the live region:\n${polite?.textContent}`,
+  );
+  app?.dispose();
+});
+
+// ---- the API key: entering one, and it reaching the engine -------------------
+//
+// The blocker this closes, measured on an Android emulator: the app launched,
+// the in-process engine loaded, and the first turn failed with "The
+// OPENAI_API_KEY environment variable is missing or empty; either provide it,
+// or instantiate the OpenAI client with an apiKey option." Settings showed
+// Engine and Engine address and nothing else. There was no field, and had there
+// been one nothing read it back: `secrets.get` had zero non-test callers and
+// the engine never received a key.
+
+test("the settings screen has a MASKED field for the API key", async () => {
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+
+  const field = keyField(dom);
+  assert.ok(field, `there must be somewhere to put a key:\n${dom.text()}`);
+  assert.equal(field.type, "password", "a credential typed in the clear is one a screenshot keeps");
+  assert.equal(field.dataset["action"], "set-secret", "it must commit through the secret path");
+  // Not `set-setting`: that path goes to StoragePort, which is the plaintext
+  // settings file this whole split exists to keep keys out of.
+  assert.notEqual(field.dataset["action"], "set-setting");
+  await app?.dispose();
+});
+
+test("a pasted key reaches the KEYCHAIN and never the settings file", async () => {
+  const storage = createFakeStorage();
+  const { dom, platform, secrets } = harness({ storage });
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+
+  const field = keyField(dom);
+  field!.value = "sk-typed-by-a-user";
+  dom.change(field as never);
+  await settle();
+
+  assert.equal(
+    await secrets.get({ slot: "openai", account: "default" }),
+    "sk-typed-by-a-user",
+    "the key must actually be stored",
+  );
+  // And nothing was written to the plain store. store.ts quotes the failure
+  // this prevents: "One reference app keyrings its API keys and then writes its
+  // proxy password to the settings file."
+  const contents: string[] = [];
+  for (const key of storage.writes) {
+    const raw = await storage.read(key);
+    if (raw !== null) contents.push(raw);
+  }
+  assert.equal(
+    contents.join("\n").includes("sk-typed-by-a-user"),
+    false,
+    `the key reached the plain settings file:\n${contents.join("\n")}`,
+  );
+  await app?.dispose();
+});
+
+test("the field is EMPTIED after a commit and the key is nowhere in the DOM", async () => {
+  // The leak this closes is not hypothetical: `settingControl` seeds a plain
+  // field from the store, and the mirror of that line on a secret row would put
+  // the credential into every screenshot, crash report and accessibility dump
+  // of this screen. The facade has no getter precisely so that line cannot be
+  // written -- and the field must not hold what the user typed either.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+
+  const field = keyField(dom);
+  field!.value = "sk-should-not-linger";
+  dom.change(field as never);
+  await settle();
+
+  assert.equal(field!.value, "", "the field must not hold the key after committing it");
+  assert.equal(
+    dom.text().includes("sk-should-not-linger"),
+    false,
+    `the key is rendered somewhere on the page:\n${dom.text()}`,
+  );
+  await app?.dispose();
+});
+
+test("re-opening Settings does not echo the stored key back into the field", async () => {
+  // The other half: a screen rebuilt from the store must have nothing to draw
+  // it FROM. This is the test that fails the day someone "helpfully" adds a
+  // secret getter to the facade and uses it.
+  const { dom, platform, secrets } = harness();
+  await secrets.set({ slot: "openai", account: "default" }, "sk-already-stored");
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+
+  assert.equal(keyField(dom)!.value, "", "a stored key must never be painted into the field");
+  assert.equal(dom.text().includes("sk-already-stored"), false, dom.text());
+  await app?.dispose();
+});
+
+test("the row says Configured from has(), without reading the value", async () => {
+  // ports/secrets.ts rule 2: "`has()` exists so the UI can render 'configured'
+  // without reading the value." A screen that answered this question with
+  // `get()` would fault the credential into the render pass every time the user
+  // opened Settings.
+  const { dom, platform, secrets } = harness();
+  await secrets.set({ slot: "openai", account: "default" }, "sk-already-stored");
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  const before = secrets.reads;
+  await openSettings(dom);
+
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Configured");
+  assert.equal(secrets.reads, before, "rendering presence must not read the secret's value");
+  await app?.dispose();
+});
+
+test("with nothing stored the row says Not set -- the pair", async () => {
+  // Without this, a row hard-wired to "Configured" would satisfy the test
+  // above, and a user with no key would be told they have one.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Not set");
+  await app?.dispose();
+});
+
+test("presence flips to Configured as soon as a key is entered", async () => {
+  // The row is the only confirmation the user gets -- the field empties itself,
+  // so a row that still said "Not set" would read as a save that silently
+  // failed, and the natural response is to paste it again.
+  const { dom, platform } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Not set");
+
+  const field = keyField(dom);
+  field!.value = "sk-fresh";
+  dom.change(field as never);
+  await settle();
+
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Configured");
+  await app?.dispose();
+});
+
+test("a pasted key is trimmed, so a trailing newline is not part of the credential", async () => {
+  // A key pasted out of a mail client or a terminal arrives with whitespace,
+  // and the provider error it produces names the KEY rather than the
+  // whitespace -- so the user concludes their key is bad.
+  const { dom, platform, secrets } = harness();
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+
+  const field = keyField(dom);
+  field!.value = "  sk-padded\n";
+  dom.change(field as never);
+  await settle();
+
+  assert.equal(await secrets.get({ slot: "openai", account: "default" }), "sk-padded");
+  await app?.dispose();
+});
+
+test("Remove takes the key back out, so 'no key' is a reachable state", async () => {
+  // A key that can be entered and replaced but never removed leaves "not
+  // configured" somewhere the user can never get back to -- and `clearSecret`
+  // was another facade method with no caller outside tests.
+  const { dom, platform, secrets } = harness();
+  await secrets.set({ slot: "openai", account: "default" }, "sk-to-remove");
+  const app = await mount({ root: dom.root as never, platform, now: () => 1, newChatId: () => "c1" });
+  await openSettings(dom);
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Configured");
+
+  const remove = dom.find((n) => n.dataset["action"] === "clear-secret");
+  assert.ok(remove, `there must be a way to remove a stored key:\n${dom.text()}`);
+  dom.click(remove as never);
+  await settle();
+
+  assert.equal(await secrets.has({ slot: "openai", account: "default" }), false);
+  assert.equal(presenceOf(dom, "openaiApiKey"), "Not set");
+  await app?.dispose();
+});
+
+test("a keychain that REJECTS says so, and does not become the app-wide crash screen", async () => {
+  // SecretsPort rejects on a real device: a locked keychain, a keystore that
+  // will not open. Left to float, that rejection reaches the global crash
+  // handler and replaces the WHOLE app with the fatal screen -- on the one
+  // screen the user is trying to repair.
+  const { dom, platform } = harness();
+  const failing = {
+    ...platform.secrets,
+    async set(): Promise<void> {
+      throw new Error("keystore is locked");
+    },
+  };
+  const app = await mount({
+    root: dom.root as never,
+    platform: { ...platform, secrets: failing },
+    now: () => 1,
+    newChatId: () => "c1",
+  });
+  await openSettings(dom);
+
+  const field = keyField(dom);
+  field!.value = "sk-will-not-store";
+  dom.change(field as never);
+  await settle();
+
+  assert.ok(
+    dom.find((n) => n.className.includes("screen-settings")),
+    "the settings screen must survive a keychain failure",
+  );
+  const note = dom.find((n) => n.dataset["settingError"] === "openaiApiKey");
+  assert.ok(note !== null && note.textContent !== "", `a refused write must be said out loud:\n${dom.text()}`);
+  assert.equal(note.hidden, false);
+  await app?.dispose();
+});
+
+test("END TO END: a key entered in Settings authenticates the very next message", async () => {
+  // The acceptance test. Everything above proves a piece; this drives the whole
+  // path the user walks -- open Settings, paste a key, go back, send a message
+  // -- through the shipping composition root, and asserts the credential
+  // reached the agent that answers. A key stored and never used is the same bug
+  // in a new place.
+  const configs: { instructions: string; llm?: string; apiKey?: string }[] = [];
+  class ScriptedAgent {
+    lastStopReason: "completed" | null = "completed";
+    constructor(config: { instructions: string; llm?: string; apiKey?: string }) {
+      configs.push(config);
+    }
+    // Present because the engine CALLS it on every turn, and this class is
+    // handed in through `loadAgent` as `never` -- so a missing member is not a
+    // typecheck failure, it is "agent.setHistory is not a function" rendered
+    // into the transcript where the answer should be.
+    setHistory() {}
+    async *streamEvents() {
+      yield { type: "text", delta: "Paris." } as const;
+      yield { type: "finish", text: "Paris." } as const;
+    }
+  }
+
+  const { dom, http, platform: web } = harness();
+  http.on("/chat", () => {
+    throw new Error("the remote engine must not be contacted on a device");
+  });
+  // `kind: "tauri"` so the device default applies and the in-process engine is
+  // what answers -- the engine that had no way to be given a key.
+  const app = await mount({
+    root: dom.root as never,
+    platform: { ...web, kind: "tauri" },
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => ScriptedAgent as never,
+  });
+  assert.equal(app?.engine.id, ENGINE_PRAISONAI_TS);
+
+  await openSettings(dom);
+  const field = keyField(dom);
+  assert.ok(field, `no key field on the settings screen:\n${dom.text()}`);
+  field.value = "sk-end-to-end";
+  dom.change(field as never);
+  await settle();
+
+  // Back to the chat and ask something.
+  dom.click(dom.find((n) => n.dataset["route"] === "chat") as never);
+  await settle();
+  submit(dom, "capital of france?");
+  await settle(120);
+
+  assert.equal(configs.length, 1, "one Agent, built on the turn -- not at boot");
+  assert.equal(
+    configs[0]?.apiKey,
+    "sk-end-to-end",
+    "the key the user entered must authenticate the agent that answers",
+  );
+  const answer = dom.find((n) => n.textContent.includes("Paris") && n.className.includes("row"));
+  assert.ok(answer, `the answer must reach the transcript:\n${dom.text()}`);
+  assert.equal(dom.find((n) => n.className.includes("row-error")), null, "and nothing must fail on the way");
+  // And the key is still not anywhere on the page.
+  assert.equal(dom.text().includes("sk-end-to-end"), false, dom.text());
+  await app?.dispose();
+});
+
+// ---- conversation memory, through the shipping composition root -------------
+//
+// engine.test.ts proves the engine restores whatever history it is handed;
+// session.test.ts proves the session projects one. Neither proves the two are
+// connected in the app that ships, and "both halves built, nothing joining
+// them" is exactly how this package lost `record()` once already. These drive
+// the real mount, the real controller, the real session and the real in-process
+// engine -- only the Agent class is scripted, through the seam appEngines
+// exposes for it.
+
+/** An Agent class that records the conversation it was restored with, per turn. */
+function rememberingAgentClass(answers: readonly string[]): {
+  readonly module: unknown;
+  readonly histories: { role: string; content: string }[][];
+  readonly prompts: string[];
+} {
+  const histories: { role: string; content: string }[][] = [];
+  const prompts: string[] = [];
+  let turn = 0;
+  class Remembering {
+    lastStopReason: "completed" | null = "completed";
+    private restored: { role: string; content: string }[] = [];
+    setHistory(messages: readonly { role: string; content: string }[]) {
+      this.restored = messages.map((m) => ({ role: m.role, content: m.content }));
+    }
+    async *streamEvents(prompt: string) {
+      histories.push(this.restored);
+      prompts.push(prompt);
+      const text = answers[Math.min(turn++, answers.length - 1)] ?? "";
+      yield { type: "finish", text } as const;
+    }
+  }
+  return { module: Remembering, histories, prompts };
+}
+
+test("ACCEPTANCE: a follow-up question reaches the model WITH the turn before it", async () => {
+  // The defect, stated as the user experiences it: ask for the capital of
+  // France, get "Paris", ask "And its population?" -- and the second question
+  // used to arrive at the provider with no subject at all, so the honest reply
+  // was a request for clarification rather than a number.
+  const { module, histories, prompts } = rememberingAgentClass([
+    "Paris.",
+    "About 2.1 million.",
+  ]);
+  const { dom, platform: web } = harness();
+  const app = await mount({
+    root: dom.root as never,
+    platform: { ...web, kind: "tauri" },
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => module as never,
+  });
+  assert.equal(app?.engine.id, ENGINE_PRAISONAI_TS);
+
+  submit(dom, "What is the capital of France?");
+  await settle(120);
+  submit(dom, "And its population?");
+  await settle(120);
+
+  assert.deepEqual(prompts, ["What is the capital of France?", "And its population?"]);
+  assert.deepEqual(histories[0], [], "the first question has nothing behind it");
+  assert.deepEqual(
+    histories[1],
+    [
+      { role: "user", content: "What is the capital of France?" },
+      { role: "assistant", content: "Paris." },
+    ],
+    "the follow-up must carry the exchange it follows",
+  );
+  await app?.dispose();
+});
+
+test("ACCEPTANCE: a conversation REOPENED after a relaunch still has its memory", async () => {
+  // Force-stop, relaunch, reopen from the chat list, ask a follow-up. A
+  // history assembled from turns seen in the current process passes the case
+  // above and fails this one -- and this is the case a phone hits every day,
+  // because a phone kills backgrounded apps.
+  const storage = createFakeStorage();
+
+  const first = rememberingAgentClass(["Paris."]);
+  const one = harness({ storage });
+  const app1 = await mount({
+    root: one.dom.root as never,
+    platform: { ...one.platform, kind: "tauri" },
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => first.module as never,
+  });
+  submit(one.dom, "What is the capital of France?");
+  await settle(120);
+  await app1?.dispose();
+
+  // A second launch over the same disk. Nothing survives in memory.
+  const second = rememberingAgentClass(["About 2.1 million."]);
+  const two = harness({ storage });
+  const app2 = await mount({
+    root: two.dom.root as never,
+    platform: { ...two.platform, kind: "tauri" },
+    now: () => 2,
+    newChatId: () => "c-fresh",
+    loadAgent: async () => second.module as never,
+  });
+
+  two.dom.click(two.dom.find((n) => n.dataset["route"] === "chats") as never);
+  await settle();
+  const row = two.dom.find((n) => n.dataset["action"] === "open-chat");
+  assert.ok(row, `the stored chat must be listed:\n${two.dom.text()}`);
+  two.dom.click(row as never);
+  await settle();
+
+  submit(two.dom, "And its population?");
+  await settle(120);
+
+  assert.deepEqual(second.prompts, ["And its population?"]);
+  assert.deepEqual(
+    second.histories[0],
+    [
+      { role: "user", content: "What is the capital of France?" },
+      { role: "assistant", content: "Paris." },
+    ],
+    "a reopened conversation must contribute its stored history",
+  );
+  await app2?.dispose();
+});
+
+test("New chat starts the model with a blank memory, not the previous conversation", async () => {
+  // The pair. A history that is merely "everything ever recorded" would leak
+  // the abandoned conversation into a chat the user believes is empty.
+  const { module, histories } = rememberingAgentClass(["Paris.", "second answer"]);
+  const { dom, platform: web } = harness();
+  const app = await mount({
+    root: dom.root as never,
+    platform: { ...web, kind: "tauri" },
+    now: () => 1,
+    newChatId: () => "c1",
+    loadAgent: async () => module as never,
+  });
+
+  submit(dom, "What is the capital of France?");
+  await settle(120);
+  dom.click(dom.find((n) => n.dataset["action"] === "new-chat") as never);
+  await settle();
+  submit(dom, "an unrelated question");
+  await settle(120);
+
+  assert.deepEqual(histories[1], [], `the new chat must start empty:\n${JSON.stringify(histories)}`);
+  await app?.dispose();
 });

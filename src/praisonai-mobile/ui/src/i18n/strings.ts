@@ -89,6 +89,27 @@ export interface Strings {
    * may already have scrolled off.
    */
   readonly settingRejected: (label: string) => string;
+  /**
+   * A secret field's placeholder, and its accessible name.
+   *
+   * Deliberately NOT the stored value and not a masked stand-in like
+   * "sk-...abcd": the field is empty on every paint (view-model.ts rule 1 --
+   * the facade has no getter, so there is nothing to echo even if a renderer
+   * wanted to), and a placeholder describing what to type is the honest way to
+   * say so. A row that showed dots would read as "a key is already here",
+   * which is what the presence label is for and what a masked echo would make
+   * ambiguous.
+   */
+  readonly secretPlaceholder: string;
+  /** Confirmation that a key was stored. NEVER contains any part of the key --
+   *  this goes to an assertive live region, which is read aloud. */
+  readonly secretStored: (label: string) => string;
+  /** Confirmation that a key was removed. Said for the same reason a refusal
+   *  is: a control that changes nothing visible and says nothing has, for the
+   *  user, done nothing. */
+  readonly secretCleared: (label: string) => string;
+  /** The button that removes a stored key. */
+  readonly actionClearSecret: string;
 
   // ---- chat list ---------------------------------------------------------
   /** A chat whose title is blank. A blank row has no hit target and reads as a
@@ -97,6 +118,31 @@ export interface Strings {
   /** A chat file that would not parse. It is NOT hidden: see
    *  ui/src/chats/list-view-model.ts. */
   readonly chatUnreadable: (id: string) => string;
+  /**
+   * A chat row's name: its title and when it was last touched.
+   *
+   * ONE string for both, because the visible time and the spoken time have to
+   * be the same characters. `ChatRow.updatedLabel` was computed by
+   * `buildChatList` on every visit to the list and rendered nowhere at all, so
+   * every row was just a title and the list could not be scanned by recency --
+   * the one thing it is sorted by.
+   */
+  readonly chatUpdated: (title: string, when: string) => string;
+  /** The delete control on a chat row. It NAMES the chat: a list of rows each
+   *  offering a button called "Delete" is a list a screen reader user cannot
+   *  delete anything from safely. */
+  readonly deleteChat: (title: string) => string;
+  /** The armed state of that control. Deleting a conversation is the only
+   *  destructive, irreversible thing in the app, so it takes two taps. */
+  readonly actionConfirmDelete: string;
+  readonly deleteChatConfirm: (title: string) => string;
+  /** Said after the row disappears. A row that vanishes silently is
+   *  indistinguishable from a list that failed to draw. */
+  readonly chatDeleted: (title: string) => string;
+  /** The write failed. StoragePort rejects on a real device -- SecurityError
+   *  with site data blocked, QuotaExceededError -- and a delete that quietly
+   *  did nothing leaves the user believing a conversation is gone. */
+  readonly chatDeleteFailed: string;
   /** "You have no chats" -- a new install. */
   readonly chatsEmpty: string;
   /** "None of your chats could be read" -- data loss, and it must not render
@@ -284,9 +330,23 @@ export const en: Strings = {
   // neither the setting nor the outcome. "was not changed" is the fact the
   // user needs: the old value is still in force.
   settingRejected: (label) => `${label} was not changed: that value was refused.`,
+  // "Paste" rather than "Enter": on a phone nobody types an API key, and the
+  // instruction that matches what the user is actually about to do is the one
+  // that reads as written for them.
+  secretPlaceholder: "Paste a key to set or replace it",
+  secretStored: (label) => `${label} saved.`,
+  secretCleared: (label) => `${label} removed.`,
+  actionClearSecret: "Remove",
 
   untitled: "Untitled",
   chatUnreadable: (id) => `Could not be read: ${id}`,
+  chatUpdated: (title, when) => `${title}, ${when}`,
+  deleteChat: (title) => `Delete ${title}`,
+  actionConfirmDelete: "Confirm",
+  // Names the chat and says the consequence. "Are you sure?" says neither.
+  deleteChatConfirm: (title) => `Delete ${title}? Tap Confirm to delete it. This cannot be undone.`,
+  chatDeleted: (title) => `${title} was deleted.`,
+  chatDeleteFailed: "That conversation could not be deleted.",
   chatsEmpty: "No conversations yet.",
   emptyTranscript: "Ask something to begin.",
   chatsAllUnreadable: (count) =>

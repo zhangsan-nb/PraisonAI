@@ -24,12 +24,12 @@ const clampNum = (min, max) => (v) =>
 const SETTINGS = [
   // ---- Models -------------------------------------------------------------
   { key: "model", section: "model", label: "Default model",
-    description: "Any OpenAI-compatible model id. New chats use this.",
+    description: "Any OpenAI-compatible model id. New chats use this. A provider-prefixed id (anthropic/…, gemini/…, ollama/…) routes through litellm to that provider — set its API key in the environment, or run Ollama locally. For an OpenAI-compatible endpoint instead, set a Base URL and use that endpoint’s bare model id.",
     keywords: ["llm", "gpt", "claude", "provider"],
     control: { kind: "combobox", suggestions: [
       "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini",
-      "claude-sonnet-4-20250514", "claude-opus-4-20250514",
-      "gemini-2.0-flash", "ollama/llama3.2",
+        "anthropic/claude-sonnet-4-20250514", "gemini/gemini-2.0-flash",
+        "ollama/llama3.2",
     ]},
     default: "gpt-4o-mini" },
 
@@ -46,6 +46,15 @@ const SETTINGS = [
   { key: "top_p", section: "model", label: "Top-p",
     control: { kind: "slider", min: 0, max: 1, step: 0.01 },
     default: 1, validate: clampNum(0, 1) },
+
+  { key: "reasoning_effort", section: "model", label: "Reasoning effort",
+    description: "How hard the model thinks before answering. Off leaves the provider default. Maps to each backend's native knob.",
+    keywords: ["thinking", "reasoning", "effort", "budget", "o1", "o3"],
+    control: { kind: "select", options: [
+      { value: "off", label: "Off" }, { value: "minimal", label: "Minimal" },
+      { value: "low", label: "Low" }, { value: "medium", label: "Medium" },
+      { value: "high", label: "High" }]},
+    default: "off" },
 
   { key: "base_url", section: "model", label: "Base URL override",
     description: "Point at a proxy, Azure, or a local server. Blank uses the provider default.",

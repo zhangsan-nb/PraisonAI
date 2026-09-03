@@ -486,6 +486,12 @@ Respond with ONLY a valid JSON tool call in this format:
         self._last_stop_reason = "completed"
         self._idle_timeout_breaker = IdleTimeoutBreaker()  # Circuit breaker for idle timeouts
         self.chat_history = []
+        # Optional Agent-supplied thread-safe append for deferred re-injection.
+        # When an Agent owns this LLM it wires its own history append here so a
+        # background-resolved defer(...) result lands on the list follow-up
+        # turns actually replay (the LLM's own chat_history has no readers in
+        # that case). Left None for standalone LLM usage.
+        self._agent_history_append = None
         self.verbose = extra_settings.get('verbose', True)
         self.markdown = extra_settings.get('markdown', True)
         self.self_reflect = extra_settings.get('self_reflect', False)
@@ -780,13 +786,20 @@ Respond with ONLY a valid JSON tool call in this format:
         error_str = str(error).lower()
         error_type = type(error).__name__.lower()
 
-        # Check for common rate limit indicators
+        # Check for common rate limit indicators. This helper has no production
+        # callers (the runtime retry path uses classify_error_kind() /
+        # resolve_failover_decision()); it exists only for tests and is kept in
+        # step with error_classifier.classify_error() via
+        # test_rate_limit_backward_compat. The two silently diverged when that
+        # classifier learned 'quota exceeded' (Gemini's phrasing for a
+        # per-minute limit) and this list did not.
         indicators = [
             '429',
             'rate limit',
             'ratelimit',
             'too many request',
             'resource_exhausted',
+            'quota exceeded',
             'tokens per minute',
         ]
 
@@ -2020,14 +2033,22 @@ Respond with ONLY a valid JSON tool call in this format:
 
             def _reinject(handle_id: str, value: Any, session_id: Optional[str]) -> None:
                 # Best-effort: this closure is invoked from a background worker
-                # thread; appending to the LLM's persistent ``chat_history``
-                # (the same list follow-up turns replay via _build_messages)
-                # makes the resolved value available on the next turn.
-                self.chat_history.append({
+                # thread. When driven by an Agent, follow-up turns replay the
+                # Agent's own history (passed as a parameter into
+                # _build_messages), not this LLM's ``chat_history`` — so we
+                # append via the Agent's thread-safe callback when one has been
+                # wired, and fall back to the LLM's own list only for standalone
+                # LLM usage.
+                message = {
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "content": f"[deferred:{function_name}] {value}",
-                })
+                }
+                history_append = getattr(self, "_agent_history_append", None)
+                if history_append is not None:
+                    history_append(message)
+                else:
+                    self.chat_history.append(message)
 
             # Atomic: only register when not already pending, so a gateway that
             # registered its own resolver for this handle first is never
@@ -4423,15 +4444,46 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                         
                         # Execute batch and add results to conversation
                         # (forward optional per-tool timeout)
+                        # ``time`` is re-imported locally further down this
+                        # function, which makes the module-level name unbound
+                        # here; use a distinct alias.
+                        from time import perf_counter as _perf_counter
+                        _batch_started = _perf_counter()
                         tool_results = executor.execute_batch(
                             tool_calls_batch, execute_tool_fn,
                             timeout_ms=self.tool_timeout_ms,
                         )
+                        _batch_elapsed = _perf_counter() - _batch_started
                         
                         for tool_result in tool_results:
                             # Register any deferred handle so its eventual
                             # background result is re-injected, not lost.
                             self._register_deferred_if_any(tool_result)
+                            # Fire the 'tool_call' display callback exactly as
+                            # the non-streaming loop does, so streaming UIs
+                            # see tool activity (Issue #4716). Best-effort: a
+                            # callback error must never break the stream.
+                            try:
+                                if tool_result.result is None:
+                                    _result_str = None
+                                else:
+                                    try:
+                                        _result_str = json.dumps(tool_result.result)
+                                    except (TypeError, ValueError):
+                                        _result_str = str(tool_result.result)
+                                _get_display_functions()['execute_sync_callback'](
+                                    'tool_call',
+                                    message=f"Calling function: {tool_result.function_name}",
+                                    tool_name=tool_result.function_name,
+                                    tool_input=tool_result.arguments,
+                                    tool_output=_result_str[:200] if _result_str else None,
+                                    # Only the batch is timed; per-tool timing
+                                    # is not available from the executor.
+                                    elapsed_time=_batch_elapsed if len(tool_results) == 1 else None,
+                                    success=tool_result.error is None,
+                                )
+                            except Exception as _cb_error:
+                                logging.debug(f"tool_call callback failed for '{tool_result.function_name}': {_cb_error}")
                             if tool_result.error is None:
                                 # Successful execution
                                 tool_message = self._create_tool_message(
@@ -4499,26 +4551,121 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                     use_streaming = False
             
             if not use_streaming:
-                # Fall back to non-streaming and yield the complete response
+                # Fall back to non-streaming. This branch is taken whenever the
+                # provider cannot stream WITH tools -- Anthropic, Gemini and
+                # Ollama all report False from _supports_streaming_tools() --
+                # and also whenever the streaming attempt above failed.
+                #
+                # It used to read message.content and nothing else. The request
+                # carried `tools`, so the model answered with tool_calls and an
+                # empty content, and every one of those calls was dropped: the
+                # tool never ran, nothing was yielded, and no warning was
+                # raised. A turn that needed a tool produced an empty stream.
+                #
+                # Run the tool loop here too, bounded by max_iter the same way
+                # the non-streaming path is.
                 try:
-                    response = self._completion_with_retry(
-                        **self._build_completion_params(
-                            messages=messages,
-                            tools=formatted_tools,
-                            temperature=temperature,
-                            stream=False,
-                            output_json=output_json,
-                            output_pydantic=output_pydantic,
-                            **kwargs
+                    is_ollama = self._is_ollama_provider()
+                    fallback_iterations = 0
+                    tool_call_count = 0
+                    max_fallback_iterations = kwargs.pop("max_iterations", self.max_iter)
+                    while fallback_iterations < max_fallback_iterations:
+                        fallback_iterations += 1
+                        response = self._completion_with_retry(
+                            **self._build_completion_params(
+                                messages=messages,
+                                tools=formatted_tools,
+                                temperature=temperature,
+                                stream=False,
+                                output_json=output_json,
+                                output_pydantic=output_pydantic,
+                                **kwargs
+                            )
                         )
-                    )
-                    
-                    if response and response.choices:
-                        content = response.choices[0].message.content
+
+                        if not (response and response.choices):
+                            break
+
+                        message = response.choices[0].message
+                        content = getattr(message, "content", None)
+                        tool_calls = getattr(message, "tool_calls", None)
+
+                        if not tool_calls or not execute_tool_fn:
+                            # Nothing to dispatch: emit whatever prose we have.
+                            # An answer with no content AND no tool calls is the
+                            # provider's business, not ours to invent.
+                            if content:
+                                yield content
+                            break
+
+                        # Record the assistant turn before the tool replies, so
+                        # the follow-up request is a valid conversation.
+                        if is_ollama:
+                            messages.append({"role": "assistant", "content": content or ""})
+                        else:
+                            messages.append({
+                                "role": "assistant",
+                                "content": content or "",
+                                "tool_calls": self._serialize_tool_calls(tool_calls),
+                            })
+
+                        # Any prose the model emitted alongside the calls is
+                        # still part of the answer.
                         if content:
-                            # Yield the complete response as a single chunk
                             yield content
-                            
+
+                        # Enforce the same per-turn guardrail the streaming and
+                        # non-streaming loops apply, so the fallback cannot run
+                        # tools past the caller's configured limit.
+                        if tool_call_count >= max_tool_calls_per_turn:
+                            logging.warning(
+                                f"Tool call limit reached ({max_tool_calls_per_turn}). "
+                                "Stopping to prevent infinite loop.")
+                            break
+                        if tool_call_count + len(tool_calls) > max_tool_calls_per_turn:
+                            remaining_calls = max_tool_calls_per_turn - tool_call_count
+                            tool_calls = tool_calls[:remaining_calls]
+                            logging.warning(
+                                f"Limiting batch to {remaining_calls} tool calls to stay "
+                                f"within limit of {max_tool_calls_per_turn}.")
+
+                        for tool_call in tool_calls:
+                            tool_call_count += 1
+                            function_name, arguments, tool_call_id = (
+                                self._extract_tool_call_info(tool_call, is_ollama))
+                            if self._tool_arguments_parse_failed(arguments):
+                                messages.append(
+                                    self._tool_parse_error_message(function_name, tool_call_id))
+                                continue
+                            try:
+                                tool_result = execute_tool_fn(function_name, arguments)
+                            except Exception as tool_error:  # noqa: BLE001
+                                # Report the failure to the model rather than
+                                # aborting the run, matching the streaming loop.
+                                logging.warning(
+                                    f"Tool '{function_name}' failed: {tool_error}")
+                                tool_result = {"error": str(tool_error)}
+                            try:
+                                _get_display_functions()['execute_sync_callback'](
+                                    'tool_call',
+                                    message=f"Calling function: {function_name}",
+                                    tool_name=function_name,
+                                    tool_input=arguments,
+                                    tool_output=str(tool_result)[:200],
+                                    success=not (isinstance(tool_result, dict)
+                                                 and 'error' in tool_result),
+                                )
+                            except Exception as cb_error:  # noqa: BLE001
+                                logging.debug(
+                                    f"tool_call callback failed for '{function_name}': {cb_error}")
+                            messages.append(self._create_tool_message(
+                                function_name, tool_result, tool_call_id, is_ollama))
+                        # Loop: ask again now the results are in the messages.
+                    else:
+                        logging.warning(
+                            f"Tool call limit reached ({max_fallback_iterations}) on the "
+                            "non-streaming fallback.")
+
                 except Exception as e:
                     logging.error(f"Non-streaming fallback failed: {e}")
                     raise
@@ -6621,6 +6768,43 @@ Output MUST be JSON with 'reflection' and 'satisfactory'.
                 if tc.function.arguments:
                     tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
         return tool_calls
+
+    def _create_tool_message(self, function_name: str, result: Any,
+                             tool_call_id: Optional[str], is_ollama: bool = False) -> Dict[str, Any]:
+        """Build the message that carries a tool's result back to the model.
+
+        get_response_stream called this from its streaming tool loop and it was
+        never defined, so the first tool result raised AttributeError. The
+        broad `except Exception` around that loop swallowed it, set
+        use_streaming = False, and dropped through to the non-streaming branch
+        -- which discarded the tool calls too. The net effect was that tool
+        calling appeared to do nothing on every streaming turn, with the real
+        cause visible only as a logged warning.
+
+        Two unit tests exercised this loop by assigning `_create_tool_message`
+        onto the instance themselves, so they passed against a method
+        production never had.
+
+        Mirrors the formatting the non-streaming loop uses, including Ollama's
+        natural-language variant.
+        """
+        if is_ollama:
+            return self._format_ollama_tool_result_message(function_name, result)
+        if result is None:
+            content = "Function returned an empty output"
+        elif isinstance(result, dict) and 'error' in result:
+            content = (f"Error: {result.get('error', 'Unknown error')}. "
+                       "Please inform the user that the operation could not be completed.")
+        elif (isinstance(result, list) and result
+                and isinstance(result[0], dict) and 'error' in result[0]):
+            content = (f"Error: {result[0].get('error', 'Unknown error')}. "
+                       "Please inform the user that the operation could not be completed.")
+        else:
+            try:
+                content = json.dumps(result)
+            except (TypeError, ValueError):
+                content = str(result)
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
 
     def _serialize_tool_calls(self, tool_calls) -> List[Dict]:
         """Convert tool calls to a serializable format for all providers."""

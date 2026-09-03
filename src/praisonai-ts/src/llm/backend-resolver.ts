@@ -12,6 +12,17 @@
 
 import type { LLMProvider, ProviderConfig } from './providers/types';
 import { getEnv } from './openaiClientOptions';
+// Static imports. resolveBackendSync() used to `require()` these inside its
+// body, which in the ESM build made scripts/esm-shim.js prepend a top-level-
+// await createRequire banner -- unbuildable for the Android 8 WebView that
+// `praisonai/mobile` targets -- and, worse, the shim repointed the require at
+// the CommonJS twin in dist/, so an ESM caller of the sync path got a SECOND
+// copy of the provider registry that could not see providers registered on the
+// first. Neither module imports this file back (no cycle), and neither loads
+// the AI SDK itself: backend.ts defers `import('ai')` until the first call.
+import { createAISDKBackend } from './providers/ai-sdk';
+import { createProvider } from './providers';
+import { resolveDefaultModel } from './default-model';
 
 export type BackendSource = 'ai-sdk' | 'native' | 'custom' | 'legacy';
 
@@ -138,9 +149,6 @@ export async function resolveBackend(
     
     if (aiSdkAvailable) {
       try {
-        // Lazy import AI SDK backend
-        const { createAISDKBackend } = await import('./providers/ai-sdk');
-
         // The AI-SDK backend keys credentials by provider id
         // (config.providers[providerId]), while ProviderConfig is flat
         // (apiKey/baseUrl). Map the flat per-agent key onto the resolved
@@ -194,7 +202,6 @@ export async function resolveBackend(
   
   // Try native provider registry
   try {
-    const { createProvider } = await import('./providers');
     const provider = createProvider(modelString, options.config);
     
     return {
@@ -230,9 +237,7 @@ export function resolveBackendSync(
   // If AI SDK availability is cached and available, try it first
   if (_aiSdkAvailable === true && (preferredBackend === 'ai-sdk' || preferredBackend === 'auto')) {
     try {
-      // This will throw if AI SDK module is not already loaded
-      const aiSdk = require('./providers/ai-sdk');
-      const backend = aiSdk.createAISDKBackend(modelString, {
+      const backend = createAISDKBackend(modelString, {
         ...options.config,
         attribution: options.attribution,
       });
@@ -249,7 +254,6 @@ export function resolveBackendSync(
   }
   
   // Use native provider
-  const { createProvider } = require('./providers');
   const provider = createProvider(modelString, options.config);
   
   return {
@@ -264,9 +268,11 @@ export function resolveBackendSync(
  * Get default model string
  */
 export function getDefaultModel(): string {
-  return getEnv('OPENAI_MODEL_NAME') || 
-         getEnv('PRAISONAI_MODEL') || 
-         'openai/gpt-4o-mini';
+  // Delegates to the shared provider walk so this and `new Agent({})` cannot
+  // disagree about what "the default model" is (Python parity:
+  // `Agent._resolve_default_model`). The bare `gpt-4o-mini` fallback parses to
+  // the openai provider, exactly as the old `openai/gpt-4o-mini` did.
+  return resolveDefaultModel();
 }
 
 // Re-export types

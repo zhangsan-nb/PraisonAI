@@ -653,12 +653,12 @@ const clampNum = (min, max) => (v) =>
 const SETTINGS = [
   // ---- Models -------------------------------------------------------------
   { key: "model", section: "model", label: "Default model",
-    description: "Any OpenAI-compatible model id. New chats use this.",
+    description: "Any OpenAI-compatible model id. New chats use this. A provider-prefixed id (anthropic/…, gemini/…, ollama/…) routes through litellm to that provider — set its API key in the environment, or run Ollama locally. For an OpenAI-compatible endpoint instead, set a Base URL and use that endpoint’s bare model id.",
     keywords: ["llm", "gpt", "claude", "provider"],
     control: { kind: "combobox", suggestions: [
       "gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "o4-mini",
-      "claude-sonnet-4-20250514", "claude-opus-4-20250514",
-      "gemini-2.0-flash", "ollama/llama3.2",
+        "anthropic/claude-sonnet-4-20250514", "gemini/gemini-2.0-flash",
+        "ollama/llama3.2",
     ]},
     default: "gpt-4o-mini" },
 
@@ -675,6 +675,15 @@ const SETTINGS = [
   { key: "top_p", section: "model", label: "Top-p",
     control: { kind: "slider", min: 0, max: 1, step: 0.01 },
     default: 1, validate: clampNum(0, 1) },
+
+  { key: "reasoning_effort", section: "model", label: "Reasoning effort",
+    description: "How hard the model thinks before answering. Off leaves the provider default. Maps to each backend's native knob.",
+    keywords: ["thinking", "reasoning", "effort", "budget", "o1", "o3"],
+    control: { kind: "select", options: [
+      { value: "off", label: "Off" }, { value: "minimal", label: "Minimal" },
+      { value: "low", label: "Low" }, { value: "medium", label: "Medium" },
+      { value: "high", label: "High" }]},
+    default: "off" },
 
   { key: "base_url", section: "model", label: "Base URL override",
     description: "Point at a proxy, Azure, or a local server. Blank uses the provider default.",
@@ -1794,14 +1803,31 @@ function renderChips(){
     const c=document.createElement('span'); c.className='chip';
     c.innerHTML='<b></b><span></span><span class="x">&times;</span>';
     c.querySelector('b').textContent=a.name;
-    c.querySelector('span').textContent=(a.text.length/1024).toFixed(1)+' kB';
+    const kb=(a.text!=null ? a.text.length : (a.size||0))/1024;
+    c.querySelector('span').textContent=kb.toFixed(1)+' kB';
     c.querySelector('.x').onclick=()=>{ attached.splice(i,1); renderChips(); };
     chips.appendChild(c);
+  });
+}
+function readAsDataURL(f){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(String(r.result||''));
+    r.onerror=()=>rej(r.error);
+    r.readAsDataURL(f);
   });
 }
 async function addFiles(list){
   for(const f of [...list].slice(0,5)){
     if(f.size>2000000){ fail('File too large', f.name+' is over 2 MB.',''); continue; }
+    // Images (and PDFs) go to the model as bytes, not stringified text, so a
+    // vision model actually sees them. Everything else keeps the text path.
+    const t=(f.type||'').toLowerCase();
+    if(t.startsWith('image/') || t==='application/pdf'){
+      const url=await readAsDataURL(f);
+      attached.push({name:f.name, url, size:f.size});
+      continue;
+    }
     const text=await f.text();
     // Clipped here, while the chip reports the real size, so a truncated file
     // can never be mistaken for a complete one.
@@ -1923,7 +1949,14 @@ async function persistCfg(patch){
     r=await fetch('http://127.0.0.1:'+PORT+'/settings',{method:'POST',
       headers:{'content-type':'application/json'},body:JSON.stringify(patch)});
   }catch(_){}
-  if(!r||!r.ok){ toast('Could not save that setting.'); return false; }
+  if(!r||!r.ok){
+    // Prefer the engine's own reason (e.g. a model id this build cannot run)
+    // over the generic line, so the user is told what to change, not just that
+    // something failed.
+    let why='';
+    try{ why=(await r.json()).error||''; }catch{}
+    toast(why||'Could not save that setting.'); return false;
+  }
   let saved=null;
   try{ saved=await r.json(); }catch{}
   CFG={...CFG,...patch}; cfg={...cfg,...patch};

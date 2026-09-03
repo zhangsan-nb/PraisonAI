@@ -442,16 +442,30 @@ setting can return the day its consumer does.
 What actually remains for praisonai-mobile, all of it unbuilt rather than
 broken:
 
-- **The platform half of the shell.** The Rust crate has the event names and
-  the pure decision functions; no iOS or Android code observes safe-area,
-  keyboard height or lifecycle yet, so none of the four events is ever emitted.
+- **The keyboard half of the shell, and an iOS back.** The Rust crate now
+  emits three of the four events: `lifecycle` from Tauri's suspend/resume/focus
+  window events, `safe-area-changed` (an empty payload, meaning "re-read the
+  CSS") on resize and scale change, and `back-gesture` from Android's system
+  back via the in-repo `tauri-plugin-back-gesture`, answered through
+  `back_gesture_result`. `keyboard-height` is still never emitted natively --
+  the TypeScript reads `visualViewport` instead, and would take a native event
+  as an override -- and nothing installs an iOS edge-swipe back. Haptics and
+  share have no plugin; the bridge's invokes for them reject and degrade.
 - **Route→view dispatch.** `ui/src/screens.ts` and `app/src/mount.ts` are built
   and tested, and `main.ts` imports neither. Tapping "Settings" pushes onto a
   stack nothing reads.
 - **Every screen except the transcript.** Settings, chat list and about have
   complete view models and no renderer.
-- **Tauri-native storage, secrets and HTTP.** Declared honestly at
-  `app/src/platform.ts`, including that WKWebView `localStorage` is evictable.
+- **Tauri-native secrets and HTTP.** Declared honestly at
+  `app/src/platform.ts`. Storage is no longer on this list: the Tauri build now
+  writes chats to the app's data directory through `src-tauri/src/store.rs`
+  (temp file, fsync, rename, fsync the directory), because the WKWebView
+  `localStorage` it used before is evictable under storage pressure -- so
+  `en.crashed`'s "Your conversations are saved" was false on a device. The
+  StoragePort contract gained an atomicity case and three relaunch cases, both
+  with break modes, and an existing install's `localStorage` data is migrated
+  once (`adapters/src/storage/migrate.ts`) so the fix cannot look like the
+  disease.
 - **The in-process praisonai-ts engine as a shipping option.** Its stated
   blocker — bare `crypto` and `events` imports on the Agent graph — is fixed
   upstream; the wiring here is not done.
@@ -475,3 +489,55 @@ already ended owns its drops; only a `before_start` drop, recorded while
 `idle`, belongs to the turn now opening. Fixed by clearing `dropped` on a
 `start` that replaces an ended turn, pinned at both hops: reverting it fails
 one reducer test and one controller test.
+
+
+## Conversation memory, and the one thing it deliberately does not do
+
+**Closed.** `engines/src/praisonai-ts/engine.ts` sent `request.prompt` and only
+`request.prompt`. Nothing in `engines/src` assembled prior messages, so the app
+stored a conversation, rendered it, and showed the model none of it. Measured on
+an Android emulator against the real provider: "What is the capital of France?"
+→ "Paris.", then "And its population?" → a request for clarification, because
+the second question arrived with no subject.
+
+The fix is `Agent.setHistory`, upstream's documented answer to exactly this
+("Restore a previously saved conversation so the model regains its memory of
+it"). The engine builds a **fresh agent per turn** — the model and the key come
+from settings and can change between messages — so upstream's own accumulation
+across `streamEvents` calls dies with each agent and the conversation has to be
+restored explicitly, every turn.
+
+**Where the layering fell out.** Conversation memory is an *engine-level*
+responsibility, owned by whoever owns the store, and it is NOT on
+`AgentEnginePort`. Widening `RunRequest` with a `history` field would hand the
+conversation to `remote-http` as well — and that engine POSTs `chat_id` to a
+server that keeps its own history for that id, so every prior turn would arrive
+twice, once from the client and once from the server's store. A doubled
+conversation is worse than a missing one: silent, growing, and it makes the
+model contradict itself. This is the same split `RegistryDeps.persistence`
+already draws for the WRITE, drawn once more for the READ: two engines, two
+owners of the conversation.
+
+### Truncation: what happens, and what a user sees
+
+`core/src/chat/history.ts` bounds a turn's history to
+`HISTORY_CHAR_BUDGET` (24,000 characters, ≈6,000 tokens) by keeping the
+**recent** end, stopping at the first message that does not fit, and dropping a
+leading assistant message so the history never begins with an answer to a
+question the model cannot see. Characters rather than tokens because tokenizing
+would pull a model-specific tokenizer into a webview bundle; the budget is
+deliberately an order of magnitude under the default model's window, because it
+exists to make the failure impossible rather than to use the window efficiently.
+
+**Still open, and stated rather than implied:** truncation is *not surfaced in
+the UI*. When it fires, the transcript on screen is unchanged — nothing is
+deleted, scrolling back still shows every message — but the model stops being
+able to refer to the oldest turns, and the user is not told. Protocol v2 has no
+event for "context was trimmed" and adding one is a protocol bump, so this is
+recorded here instead of being half-done. `truncateHistory` already returns
+`dropped`, so the value a notice would carry exists; nothing consumes it yet.
+
+**Also still open:** `remote-http` conversations remain server-owned end to end,
+so a chat answered by the default remote engine leaves the local session empty
+and has no local history to restore. That is the same scope note Gap 4 carries
+and it is unchanged by this.
