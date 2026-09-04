@@ -254,6 +254,70 @@ button:disabled { opacity: .45; cursor: default; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .empty { margin: auto; color: var(--soft); text-align: center; padding: 2rem 1rem; }
+
+/*
+ * The empty chat: the welcome, and the "you need a key" guidance.
+ *
+ * A SIBLING of `.transcript`, not a child -- app/src/main.ts says why (three
+ * separate code paths would delete or displace it in there). That makes the
+ * height the one thing this stylesheet has to get right: `.transcript` is
+ * `flex: 1`, so with a second `flex: 1` beside it the two would split the
+ * screen and the panel would sit in the lower half with a tall blank box above
+ * it. While the panel is up, the transcript gives up its stretch and shrinks to
+ * its content -- which is nothing, or the "engine is not answering" notice, and
+ * that notice must stay VISIBLE above the panel rather than being hidden with
+ * the rows it has none of.
+ *
+ * `data-empty` is written by main.ts and carries the KIND, so a future state
+ * can be styled differently without another attribute. The selector below only
+ * needs its presence.
+ *
+ * Colours are tokens, never literals: `--ink`, `--soft` and `--accent` are all
+ * redefined under `prefers-color-scheme: dark` at the top of this file, so the
+ * panel follows the device theme with no rule of its own. A hardcoded #14171c
+ * here would be invisible on the dark ground -- which is the whole reason the
+ * tokens exist.
+ */
+.screen[data-empty] .transcript { flex: 0 0 auto; }
+
+.empty-state {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  text-align: center;
+  /* The inline padding follows the safe area for the same reason every other
+     screen's does: a landscape cutout would otherwise clip the first and last
+     characters of every line. */
+  padding: 1.5rem calc(var(--inset-right) + 1.25rem)
+           1.5rem calc(var(--inset-left) + 1.25rem);
+}
+/* Stated explicitly, exactly as `.screen[hidden]` and `.setting-error[hidden]`
+   are: the author `display: flex` above beats the user agent's
+   `[hidden] { display: none }`, so without this line `emptyPanel.hidden = true`
+   does nothing and the welcome panel stays on screen underneath the
+   conversation. That is the same defect app/src/mount.ts hit, in a new place. */
+.empty-state[hidden] { display: none; }
+
+.empty-state .empty-title {
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+/* Muted, and narrow: a centred sentence running the full width of a phone is
+   read as a paragraph of prose rather than as one line of guidance. */
+.empty-state .empty-body {
+  margin: 0;
+  max-width: 30ch;
+  color: var(--soft);
+  font-size: .95rem;
+}
+.empty-state button { margin-top: .5rem; }
+.empty-state button[hidden] { display: none; }
 /*
  * A row in the chat list. `.row-chat` is the class `buildChatsScreen` emits;
  * this block was written as `.chat-row`, which the app has never painted, so
@@ -358,3 +422,45 @@ button:disabled { opacity: .45; cursor: default; }
   clip-path: inset(50%);
   white-space: nowrap;
 }
+
+/*
+ * The boot indicator, painted from index.html on the first frame.
+ *
+ * These rules are the reason it is worth painting at all: this stylesheet is a
+ * render-blocking <link> in <head>, so it is parsed BEFORE the first frame,
+ * while app.js is a deferred module that is not. Style the indicator from
+ * script and it would appear only once the thing it exists to cover for has
+ * already arrived.
+ *
+ * Every colour is a token from :root, never a literal, and that is what makes
+ * the indicator theme-correct without knowing the theme exists: the dark block
+ * above redefines --ground/--ink/--soft/--bad, so a dark device gets a dark
+ * boot screen and then a dark app. A hardcoded #fff here would have produced
+ * the one outcome worse than the blank page -- a white flash handing over to a
+ * dark UI on every launch.
+ *
+ * `margin: auto` inside `#root`'s flex column centres it, the same idiom
+ * `.empty` uses. The insets are still added as padding: centred content
+ * clears a status bar on a phone-shaped viewport by construction, but a short
+ * landscape viewport or a large font scale can push these lines into a cutout,
+ * and `--inset-*` falls back to `env()` here because nothing has run yet to
+ * write the shell's real numbers over it.
+ */
+.boot {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .4rem;
+  text-align: center;
+  padding: calc(var(--inset-top) + 1rem) calc(var(--inset-right) + 1.25rem)
+           calc(var(--inset-bottom) + 1rem) calc(var(--inset-left) + 1.25rem);
+}
+.boot-mark { margin: 0; font-size: 1.4rem; font-weight: 600; color: var(--ink); }
+.boot-note { margin: 0; font-size: .9rem; color: var(--soft); }
+/* The failure notice boot-guard.js reveals. `[hidden]` is spelled out for the
+   same reason `.screen[hidden]` and `.setting-error[hidden]` are: an author
+   `display` declaration beats the user agent's, and this repository has twice
+   shipped an element that ignored `hidden` because of one. */
+.boot-failed { margin: .4rem 0 0; max-width: 22rem; font-size: .9rem; color: var(--bad); }
+.boot-note[hidden], .boot-failed[hidden] { display: none; }
