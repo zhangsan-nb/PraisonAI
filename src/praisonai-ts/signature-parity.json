@@ -4418,8 +4418,8 @@
         }
       ],
       "typescript": {
-        "ctor_location": "src/praisonai-ts/src/llm/index.ts:466",
-        "location": "src/praisonai-ts/src/llm/index.ts:286"
+        "ctor_location": "src/praisonai-ts/src/llm/index.ts:416",
+        "location": "src/praisonai-ts/src/llm/index.ts:236"
       }
     },
     "PraisonAIError.__init__": {
