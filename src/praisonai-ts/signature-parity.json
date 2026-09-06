@@ -182,7 +182,7 @@
           "default": null,
           "default_kind": "literal",
           "gap": {
-            "detail": "default differs: python=null typescript=`llmName || resolveDefaultModel()` (TS `model`)",
+            "detail": "default differs: python=null typescript=`llmName || authModel || resolveDefaultModel()` (TS `model`)",
             "kind": "default"
           },
           "kind": "positional",
@@ -191,7 +191,7 @@
           "required": false,
           "ts": {
             "canonical": "model",
-            "default": "llmName || resolveDefaultModel()",
+            "default": "llmName || authModel || resolveDefaultModel()",
             "default_kind": "expr",
             "kind": "property",
             "name": "model",
@@ -1221,8 +1221,8 @@
         }
       ],
       "typescript": {
-        "ctor_location": "src/praisonai-ts/src/agent/simple.ts:753",
-        "location": "src/praisonai-ts/src/agent/simple.ts:113"
+        "ctor_location": "src/praisonai-ts/src/agent/simple.ts:900",
+        "location": "src/praisonai-ts/src/agent/simple.ts:196"
       }
     },
     "Agent.chat": {
@@ -1692,7 +1692,7 @@
         }
       ],
       "typescript": {
-        "location": "src/praisonai-ts/src/agent/simple.ts:2457",
+        "location": "src/praisonai-ts/src/agent/simple.ts:3344",
         "options_interfaces": [
           "options: AgentChatOptions"
         ],
@@ -1946,7 +1946,7 @@
         }
       ],
       "typescript": {
-        "location": "src/praisonai-ts/src/agent/simple.ts:1810",
+        "location": "src/praisonai-ts/src/agent/simple.ts:2305",
         "options_interfaces": [
           "options: AgentChatOptions"
         ],
@@ -2186,8 +2186,8 @@
             "kind": "property",
             "name": "memory",
             "required": false,
-            "type_class": "unknown",
-            "type_text": "unknown"
+            "type_class": "object",
+            "type_text": "TeamMemoryInput"
           },
           "ts_name": "memory",
           "type_class": "unknown",
@@ -2211,8 +2211,8 @@
             "kind": "property",
             "name": "planning",
             "required": false,
-            "type_class": "unknown",
-            "type_text": "unknown"
+            "type_class": "object",
+            "type_text": "TeamPlanningInput"
           },
           "ts_name": "planning",
           "type_class": "unknown",
@@ -2236,8 +2236,8 @@
             "kind": "property",
             "name": "context",
             "required": false,
-            "type_class": "unknown",
-            "type_text": "unknown"
+            "type_class": "object",
+            "type_text": "TeamContextInput"
           },
           "ts_name": "context",
           "type_class": "unknown",
@@ -2286,8 +2286,8 @@
             "kind": "property",
             "name": "execution",
             "required": false,
-            "type_class": "unknown",
-            "type_text": "unknown"
+            "type_class": "object",
+            "type_text": "TeamExecutionInput"
           },
           "ts_name": "execution",
           "type_class": "unknown",
@@ -2311,8 +2311,8 @@
             "kind": "property",
             "name": "hooks",
             "required": false,
-            "type_class": "unknown",
-            "type_text": "unknown"
+            "type_class": "object",
+            "type_text": "TeamHooksInput"
           },
           "ts_name": "hooks",
           "type_class": "unknown",
@@ -2587,8 +2587,8 @@
         }
       ],
       "typescript": {
-        "ctor_location": "src/praisonai-ts/src/agent/team.ts:210",
-        "location": "src/praisonai-ts/src/agent/team.ts:17"
+        "ctor_location": "src/praisonai-ts/src/agent/team.ts:342",
+        "location": "src/praisonai-ts/src/agent/team.ts:78"
       }
     },
     "AgentTeam.start": {
@@ -2698,7 +2698,7 @@
         }
       ],
       "typescript": {
-        "location": "src/praisonai-ts/src/agent/team.ts:383",
+        "location": "src/praisonai-ts/src/agent/team.ts:770",
         "options_interfaces": [
           "options: AgentTeamStartOptions"
         ],
@@ -6434,8 +6434,8 @@
         }
       ],
       "typescript": {
-        "ctor_location": "src/praisonai-ts/src/agent/types.ts:322",
-        "location": "src/praisonai-ts/src/agent/types.ts:64"
+        "ctor_location": "src/praisonai-ts/src/agent/types.ts:379",
+        "location": "src/praisonai-ts/src/agent/types.ts:115"
       }
     },
     "ToolsetRegistry.register_toolset": {

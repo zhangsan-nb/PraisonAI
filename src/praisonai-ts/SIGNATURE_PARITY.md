@@ -42,7 +42,7 @@ This complements `PARITY.md`, which only tracks whether an export exists.
 ### `Agent.__init__`
 
 - Python: `src/praisonai-agents/praisonaiagents/agent/agent.py:609`
-- TypeScript: `src/praisonai-ts/src/agent/simple.ts:113` (ctor `src/praisonai-ts/src/agent/simple.ts:753`)
+- TypeScript: `src/praisonai-ts/src/agent/simple.ts:196` (ctor `src/praisonai-ts/src/agent/simple.ts:900`)
 - Counts: 42 python params: 29 exact, 8 camelCase, 3 alias, 2 flattened, 0 missing; 6 mismatches; 6 waived; 14 TS-only of 59
 
 | Python param | Kind | Py default | Py type | Match | TS name | TS default | TS type | Status |
@@ -53,7 +53,7 @@ This complements `PARITY.md`, which only tracks whether an export exists.
 | `backstory` | positional | null | `Optional[str]` | exact | `backstory` | `config.instructions` | `string` | default mismatch (waived) |
 | `instructions` | positional | null | `Optional[str]` | exact | `instructions` | undefined | `string` | ok |
 | `llm` | positional | null | `Optional[Union[str, Any]]` | exact | `llm` | undefined | `string \| LLMConfig` | ok |
-| `model` | positional | null | `Optional[Union[str, Any]]` | exact | `model` | `llmName \|\| resolveDefaultModel()` | `string` | default mismatch (waived) |
+| `model` | positional | null | `Optional[Union[str, Any]]` | exact | `model` | `llmName \|\| authModel \|\| resolveDefaultModel()` | `string` | default mismatch (waived) |
 | `base_url` | positional | null | `Optional[str]` | alias | `baseURL` | undefined | `string` | ok |
 | `api_key` | positional | null | `Optional[str]` | camelCase | `apiKey` | undefined | `string` | ok |
 | `auth` | positional | null | `Optional[str]` | exact | `auth` | undefined | `string` | ok |
@@ -95,7 +95,7 @@ TS-only members: `config`, `pretty`?, `fetch`?, `outputSchema`?, `outputSchemaNa
 ### `AgentTeam.__init__`
 
 - Python: `src/praisonai-agents/praisonaiagents/agents/agents.py:648`
-- TypeScript: `src/praisonai-ts/src/agent/team.ts:17` (ctor `src/praisonai-ts/src/agent/team.ts:210`)
+- TypeScript: `src/praisonai-ts/src/agent/team.ts:78` (ctor `src/praisonai-ts/src/agent/team.ts:342`)
 - Python aliases: PraisonAIAgents, Agents
 - Counts: 23 python params: 20 exact, 3 camelCase, 0 alias, 0 flattened, 0 missing; 1 mismatches; 1 waived; 3 TS-only of 26
 
@@ -109,12 +109,12 @@ TS-only members: `config`, `pretty`?, `fetch`?, `outputSchema`?, `outputSchemaNa
 | `variables` | positional | null | `Optional[Dict[str, Any]]` | exact | `variables` | undefined | `Record<string, unknown>` | ok |
 | `llm` | positional | null | `Optional[str]` | exact | `llm` | undefined | `string` | ok |
 | `model` | positional | null | `Optional[str]` | exact | `model` | undefined | `string` | ok |
-| `memory` | positional | false | `Optional[Any]` | exact | `memory` | undefined | `unknown` | ok |
-| `planning` | positional | false | `Optional[Any]` | exact | `planning` | undefined | `unknown` | ok |
-| `context` | positional | false | `Optional[Any]` | exact | `context` | undefined | `unknown` | ok |
+| `memory` | positional | false | `Optional[Any]` | exact | `memory` | undefined | `TeamMemoryInput` | ok |
+| `planning` | positional | false | `Optional[Any]` | exact | `planning` | undefined | `TeamPlanningInput` | ok |
+| `context` | positional | false | `Optional[Any]` | exact | `context` | undefined | `TeamContextInput` | ok |
 | `output` | positional | null | `Optional[Any]` | exact | `output` | undefined | `unknown` | ok |
-| `execution` | positional | null | `Optional[Any]` | exact | `execution` | undefined | `unknown` | ok |
-| `hooks` | positional | null | `Optional[Any]` | exact | `hooks` | undefined | `unknown` | ok |
+| `execution` | positional | null | `Optional[Any]` | exact | `execution` | undefined | `TeamExecutionInput` | ok |
+| `hooks` | positional | null | `Optional[Any]` | exact | `hooks` | undefined | `TeamHooksInput` | ok |
 | `autonomy` | positional | null | `Optional[Any]` | exact | `autonomy` | undefined | `unknown` | ok |
 | `knowledge` | positional | null | `Optional[Any]` | exact | `knowledge` | undefined | `unknown` | ok |
 | `guardrails` | positional | null | `Optional[Any]` | exact | `guardrails` | undefined | `unknown` | ok |
@@ -130,7 +130,7 @@ TS-only members: `configOrAgents`, `verbose`?, `pretty`?
 ### `Task.__init__`
 
 - Python: `src/praisonai-agents/praisonaiagents/task/task.py:48`
-- TypeScript: `src/praisonai-ts/src/agent/types.ts:64` (ctor `src/praisonai-ts/src/agent/types.ts:322`)
+- TypeScript: `src/praisonai-ts/src/agent/types.ts:115` (ctor `src/praisonai-ts/src/agent/types.ts:379`)
 - Counts: 60 python params: 31 exact, 29 camelCase, 0 alias, 0 flattened, 0 missing; 7 mismatches; 7 waived; 1 TS-only of 62
 
 | Python param | Kind | Py default | Py type | Match | TS name | TS default | TS type | Status |
@@ -201,7 +201,7 @@ TS-only members: `dependencies`?
 ### `Agent.start`
 
 - Python: `src/praisonai-agents/praisonaiagents/agent/execution_mixin.py:832`
-- TypeScript: `src/praisonai-ts/src/agent/simple.ts:1810`
+- TypeScript: `src/praisonai-ts/src/agent/simple.ts:2305`
 - Counts: 1 python params: 1 exact, 0 camelCase, 0 alias, 0 flattened, 0 missing; 0 mismatches; 0 waived; 20 TS-only of 21
 
 | Python param | Kind | Py default | Py type | Match | TS name | TS default | TS type | Status |
@@ -213,7 +213,7 @@ TS-only members: `previousResult`?, `onToken`?, `signal`?, `onEvent`?, `options`
 ### `Agent.chat`
 
 - Python: `src/praisonai-agents/praisonaiagents/agent/chat_mixin.py:3101`
-- TypeScript: `src/praisonai-ts/src/agent/simple.ts:2457`
+- TypeScript: `src/praisonai-ts/src/agent/simple.ts:3344`
 - Counts: 17 python params: 7 exact, 9 camelCase, 1 alias, 0 flattened, 0 missing; 0 mismatches; 0 waived; 2 TS-only of 19
 
 | Python param | Kind | Py default | Py type | Match | TS name | TS default | TS type | Status |
@@ -241,7 +241,7 @@ TS-only members: `previousResult`?, `options`?
 ### `AgentTeam.start`
 
 - Python: `src/praisonai-agents/praisonaiagents/agents/agents.py:2007`
-- TypeScript: `src/praisonai-ts/src/agent/team.ts:383`
+- TypeScript: `src/praisonai-ts/src/agent/team.ts:770`
 - Counts: 3 python params: 2 exact, 1 camelCase, 0 alias, 0 flattened, 0 missing; 0 mismatches; 0 waived; 1 TS-only of 4
 
 | Python param | Kind | Py default | Py type | Match | TS name | TS default | TS type | Status |
